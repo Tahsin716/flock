@@ -1,40 +1,54 @@
 package core
 
+// ErrorMode defines how the Group handles errors from goroutines
 type ErrorMode int
 
 const (
-	FailFast ErrorMode = iota
-	CollectAll
+	// CollectAll collects all errors and returns them as an aggregate
+	CollectAll ErrorMode = iota
+	// FailFast cancels the group on first error and returns it
+	FailFast
+	// IgnoreErrors ignores all errors from goroutines
 	IgnoreErrors
 )
 
-type groupOptions struct {
-	errorMode  ErrorMode
-	bufferSize int
+// Config holds configuration for a Group
+type Config struct {
+	errorMode   ErrorMode
+	errorBuffer int
 }
 
-func DefaultOptions() groupOptions {
-	return groupOptions{
-		errorMode:  CollectAll,
-		bufferSize: 0,
+// Option configures a Group
+type Option func(*Config)
+
+// BuildConfig creates a config from options, starting with defaults
+func BuildConfig(opts []Option) Config {
+	config := DefaultConfig()
+	for _, opt := range opts {
+		opt(&config)
+	}
+	return config
+}
+
+// DefaultConfig returns the default configuration
+func DefaultConfig() Config {
+	return Config{
+		errorMode:   CollectAll,
+		errorBuffer: 16,
 	}
 }
 
-// Option type for functional options.
-type Option func(*groupOptions)
-
-func WithFailFast() Option {
-	return func(o *groupOptions) { o.errorMode = FailFast }
+// WithErrorMode sets how errors are handled
+func WithErrorMode(mode ErrorMode) Option {
+	return func(c *Config) { c.errorMode = mode }
 }
 
-func WithCollectAll() Option {
-	return func(o *groupOptions) { o.errorMode = CollectAll }
-}
-
-func WithIgnoreErrors() Option {
-	return func(o *groupOptions) { o.errorMode = IgnoreErrors }
-}
-
-func WithBufferSize(n int) Option {
-	return func(o *groupOptions) { o.bufferSize = n }
+// WithErrorBuffer sets the error channel buffer size
+func WithErrorBuffer(n int) Option {
+	return func(c *Config) {
+		if n < 0 {
+			n = 0
+		}
+		c.errorBuffer = n
+	}
 }
