@@ -4,10 +4,10 @@ package group
 type ErrorMode int
 
 const (
-	// CollectAll collects all errors and returns them as an aggregate
-	CollectAll ErrorMode = iota
 	// FailFast cancels the group on first error and returns it
-	FailFast
+	FailFast = iota
+	// CollectAll collects all errors and returns them as an aggregate
+	CollectAll
 	// IgnoreErrors ignores all errors from goroutines
 	IgnoreErrors
 )
@@ -32,7 +32,7 @@ func BuildConfig(opts []Option) Config {
 // DefaultConfig returns the default configuration
 func DefaultConfig() Config {
 	return Config{
-		errorMode: CollectAll,
+		errorMode: FailFast,
 	}
 }
 
