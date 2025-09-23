@@ -5,7 +5,7 @@ type ErrorMode int
 
 const (
 	// FailFast cancels the group on first error and returns it
-	FailFast = iota
+	FailFast ErrorMode = iota
 	// CollectAll collects all errors and returns them as an aggregate
 	CollectAll
 	// IgnoreErrors ignores all errors from goroutines
@@ -20,23 +20,16 @@ type Config struct {
 // Option configures a Group
 type Option func(*Config)
 
-// BuildConfig creates a config from options, starting with defaults
-func BuildConfig(opts []Option) Config {
-	config := DefaultConfig()
-	for _, opt := range opts {
-		opt(&config)
-	}
-	return config
-}
-
 // DefaultConfig returns the default configuration
 func DefaultConfig() Config {
 	return Config{
-		errorMode: FailFast,
+		errorMode: CollectAll, // Changed back to CollectAll as it's more common default
 	}
 }
 
 // WithErrorMode sets how errors are handled
 func WithErrorMode(mode ErrorMode) Option {
-	return func(c *Config) { c.errorMode = mode }
+	return func(c *Config) {
+		c.errorMode = mode
+	}
 }

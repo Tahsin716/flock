@@ -13,19 +13,3 @@ type PanicError struct {
 func (p *PanicError) Error() string {
 	return fmt.Sprintf("panic: %v\n%s", p.Value, p.Stack)
 }
-
-// AggregateError wraps multiple errors (for CollectAll mode)
-type AggregateError struct {
-	Errors []error
-}
-
-func (a AggregateError) Error() string {
-	if len(a.Errors) == 0 {
-		return "no errors"
-	}
-	return fmt.Sprintf("%d errors: %v", len(a.Errors), a.Errors)
-}
-
-func (a AggregateError) Unwrap() []error {
-	return a.Errors
-}
