@@ -5,7 +5,6 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // Group manages a collection of goroutines with structured concurrency
@@ -43,22 +42,6 @@ func NewGroupWithContext(ctx context.Context, opts ...Option) *Group {
 		config: config,
 		errors: make([]error, 0),
 	}
-}
-
-// NewGroupWithTimeout creates a Group with a timeout
-func NewGroupWithTimeout(timeout time.Duration, opts ...Option) *Group {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	g := NewGroupWithContext(ctx, opts...)
-	g.cancel = cancel // Override to use the timeout cancel
-	return g
-}
-
-// NewGroupWithDeadline creates a Group with a deadline
-func NewGroupWithDeadline(deadline time.Time, opts ...Option) *Group {
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	g := NewGroupWithContext(ctx, opts...)
-	g.cancel = cancel // Override to use the deadline cancel
-	return g
 }
 
 // Go runs a new function in a new goroutine with panic recovery
