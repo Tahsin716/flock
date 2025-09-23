@@ -1,4 +1,4 @@
-package core
+package group
 
 import (
 	"context"
@@ -16,21 +16,10 @@ type Group struct {
 	config Config
 
 	// Error handling
-	errors    chan error
-	errorOnce sync.Once
-	closeOnce sync.Once
-
-	// State tracking
-	running   int64
-	completed int64
-	failed    int64
-}
-
-// Stats provides information about goroutine execution
-type Stats struct {
-	Running   int64
-	Completed int64
-	Failed    int64
+	errors    []error
+	errorsMux sync.RWMutex
+	failOnce  sync.Once
+	firstErr  atomic.Value // used in FailFast
 }
 
 // NewGroup creates a new Group with the given options
@@ -48,14 +37,12 @@ func NewGroupWithContext(ctx context.Context, opts ...Option) *Group {
 
 	groupCtx, cancel := context.WithCancel(ctx)
 
-	g := &Group{
+	return &Group{
 		ctx:    groupCtx,
 		cancel: cancel,
 		config: config,
-		errors: make(chan error, config.errorBuffer),
+		errors: make([]error, 0),
 	}
-
-	return g
 }
 
 // NewGroupWithTimeout creates a Group with a timeout
@@ -74,22 +61,16 @@ func NewGroupWithDeadline(deadline time.Time, opts ...Option) *Group {
 	return g
 }
 
-// Go runs a new function in new goroutine with panic recovery
-func (g *Group) Go(fn func(context.Context) error) error {
-	atomic.AddInt64(&g.running, 1)
+// Go runs a new function in a new goroutine with panic recovery
+func (g *Group) Go(fn func(context.Context) error) {
 	g.wg.Add(1)
 
 	go func() {
-		defer func() {
-			atomic.AddInt64(&g.running, -1)
-			atomic.AddInt64(&g.completed, 1)
-			g.wg.Done()
-		}()
+		defer g.wg.Done()
 
 		// Handle panics
 		defer func() {
 			if r := recover(); r != nil {
-				atomic.AddInt64(&g.failed, 1)
 				panicErr := &PanicError{
 					Value: r,
 					Stack: string(debug.Stack()),
@@ -100,55 +81,49 @@ func (g *Group) Go(fn func(context.Context) error) error {
 
 		// Run the function
 		if err := fn(g.ctx); err != nil {
-			atomic.AddInt64(&g.failed, 1)
 			g.handleError(err)
 		}
 	}()
-
-	return nil
 }
 
 // GoSafe runs a function in a new goroutine, ignoring errors and panics
 // This is for fire-and-forget tasks
-func (g *Group) GoSafe(fn func(context.Context)) error {
-	return g.Go(func(ctx context.Context) error {
+func (g *Group) GoSafe(fn func(context.Context)) {
+	g.Go(func(ctx context.Context) error {
 		fn(ctx)
 		return nil
 	})
 }
 
-// Wait waits for all goroutines to complete and returns any errors
+// Wait waits for all goroutines to complete and returns any errors.
 func (g *Group) Wait() error {
 	g.wg.Wait()
 	g.Stop()
 
-	// Close errors channel to signal no more errors
-	g.closeOnce.Do(func() {
-		close(g.errors)
-	})
+	switch g.config.errorMode {
+	case IgnoreErrors:
+		return nil
 
-	if g.config.errorMode == IgnoreErrors {
-		// Drain the channel but ignore errors
-		for range g.errors {
+	case FailFast:
+		if v := g.firstErr.Load(); v != nil {
+			return v.(error)
 		}
 		return nil
-	}
 
-	// Collect errors
-	var collectedErrors []error
-	for err := range g.errors {
-		collectedErrors = append(collectedErrors, err)
-		if g.config.errorMode == FailFast {
-			return err // Return first error immediately
+	case CollectAll:
+		g.errorsMux.RLock()
+		collectedErrors := make([]error, len(g.errors))
+		copy(collectedErrors, g.errors)
+		g.errorsMux.RUnlock()
+
+		if len(collectedErrors) > 0 {
+			return AggregateError{Errors: collectedErrors}
 		}
-	}
+		return nil
 
-	// Return aggregate error if we have errors and we're collecting all
-	if len(collectedErrors) > 0 && g.config.errorMode == CollectAll {
-		return &AggregateError{Errors: collectedErrors}
+	default:
+		return nil
 	}
-
-	return nil
 }
 
 // Stop cancels the group context, signaling all goroutines to stop
@@ -156,35 +131,24 @@ func (g *Group) Stop() {
 	g.cancel()
 }
 
-// Stats returns current statistics about the group
-func (g *Group) Stats() Stats {
-	return Stats{
-		Running:   atomic.LoadInt64(&g.running),
-		Completed: atomic.LoadInt64(&g.completed),
-		Failed:    atomic.LoadInt64(&g.failed),
-	}
-}
-
 // handleError processes an error according to the error mode
 func (g *Group) handleError(err error) {
 	switch g.config.errorMode {
 	case IgnoreErrors:
 		return
+
 	case FailFast:
-		// Send error and cancel (but only once)
-		g.errorOnce.Do(func() {
-			select {
-			case g.errors <- err:
-			default:
-				// Buffer full, but we're canceling anyway
+		if g.firstErr.Load() == nil {
+			if g.firstErr.CompareAndSwap(nil, err) {
+				g.failOnce.Do(func() {
+					g.cancel()
+				})
 			}
-			g.cancel()
-		})
-	case CollectAll:
-		select {
-		case g.errors <- err:
-		default:
-			// Buffer full - could log this or handle differently
 		}
+
+	case CollectAll:
+		g.errorsMux.Lock()
+		g.errors = append(g.errors, err)
+		g.errorsMux.Unlock()
 	}
 }

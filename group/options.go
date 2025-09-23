@@ -1,4 +1,4 @@
-package core
+package group
 
 // ErrorMode defines how the Group handles errors from goroutines
 type ErrorMode int
@@ -14,8 +14,7 @@ const (
 
 // Config holds configuration for a Group
 type Config struct {
-	errorMode   ErrorMode
-	errorBuffer int
+	errorMode ErrorMode
 }
 
 // Option configures a Group
@@ -33,22 +32,11 @@ func BuildConfig(opts []Option) Config {
 // DefaultConfig returns the default configuration
 func DefaultConfig() Config {
 	return Config{
-		errorMode:   CollectAll,
-		errorBuffer: 16,
+		errorMode: CollectAll,
 	}
 }
 
 // WithErrorMode sets how errors are handled
 func WithErrorMode(mode ErrorMode) Option {
 	return func(c *Config) { c.errorMode = mode }
-}
-
-// WithErrorBuffer sets the error channel buffer size
-func WithErrorBuffer(n int) Option {
-	return func(c *Config) {
-		if n < 0 {
-			n = 0
-		}
-		c.errorBuffer = n
-	}
 }
