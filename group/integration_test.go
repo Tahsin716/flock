@@ -90,3 +90,54 @@ func TestTimeoutScenario(t *testing.T) {
 		t.Errorf("Expected no normal completions due to timeout, got %d", atomic.LoadInt32(&completed))
 	}
 }
+
+func TestGracefulShutdown(t *testing.T) {
+	g := New(WithErrorMode(CollectAll))
+
+	started := int32(0)
+	finished := int32(0)
+
+	// Add long-running tasks
+	for i := 0; i < 5; i++ {
+		g.Go(func(ctx context.Context) error {
+			atomic.AddInt32(&started, 1)
+			defer atomic.AddInt32(&finished, 1)
+
+			select {
+			case <-time.After(1 * time.Second):
+				return nil
+			case <-ctx.Done():
+				// Simulate cleanup work
+				time.Sleep(10 * time.Millisecond)
+				return ctx.Err()
+			}
+		})
+	}
+
+	// Wait for all to start
+	for atomic.LoadInt32(&started) < 5 {
+		time.Sleep(time.Millisecond)
+	}
+
+	// Initiate graceful shutdown
+	g.Stop()
+
+	start := time.Now()
+	err := g.Wait()
+	duration := time.Since(start)
+
+	// Should complete quickly due to cancellation
+	if duration > 100*time.Millisecond {
+		t.Errorf("Graceful shutdown took too long: %v", duration)
+	}
+
+	// Should get cancellation errors
+	if err == nil {
+		t.Fatal("Expected cancellation error")
+	}
+
+	// All tasks should have finished (either normally or via cancellation)
+	if atomic.LoadInt32(&finished) != 5 {
+		t.Errorf("Expected all 5 tasks to finish, got %d", atomic.LoadInt32(&finished))
+	}
+}
