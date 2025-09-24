@@ -152,3 +152,65 @@ func TestPanicRecovery(t *testing.T) {
 		t.Errorf("Expected 1 failed goroutine, got %d", stats.Failed)
 	}
 }
+
+func TestPanicInFailFastMode(t *testing.T) {
+	g := New(WithErrorMode(FailFast))
+
+	var wg sync.WaitGroup
+
+	// Add goroutine that panics
+	wg.Add(1)
+	g.Go(func(ctx context.Context) error {
+		defer wg.Done()
+		panic("test panic")
+	})
+
+	// Add goroutine that should be cancelled
+	wg.Add(1)
+	g.Go(func(ctx context.Context) error {
+		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+			return nil
+		}
+	})
+
+	err := g.Wait()
+	wg.Wait()
+
+	if err == nil {
+		t.Fatal("Expected error from panic, got nil")
+	}
+
+	// Should be either the panic error or context cancellation error
+	if !strings.Contains(err.Error(), "panic") && !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("Unexpected error type: %v", err)
+	}
+}
+
+func TestMultipleWait(t *testing.T) {
+	g := New()
+
+	g.Go(func(ctx context.Context) error {
+		return errors.New("test error")
+	})
+
+	// First Wait call
+	err1 := g.Wait()
+	if err1 == nil {
+		t.Error("Expected error from first Wait call")
+	}
+
+	// Second Wait call should return the same result
+	err2 := g.Wait()
+	if err2 == nil {
+		t.Error("Expected error from second Wait call")
+	}
+
+	// Both should contain the same error
+	if err1.Error() != err2.Error() {
+		t.Errorf("Multiple Wait() calls should return consistent results: %v != %v", err1, err2)
+	}
+}
