@@ -60,3 +60,18 @@ func TestNewWithTimeout(t *testing.T) {
 		t.Fatal("NewWithTimeout with negative value should still create group")
 	}
 }
+
+func TestNewWithDeadline(t *testing.T) {
+	deadline := time.Now().Add(100 * time.Millisecond)
+	g := NewWithDeadline(deadline)
+
+	ctxDeadline, ok := g.ctx.Deadline()
+	if !ok {
+		t.Error("Context should have deadline")
+	}
+
+	// Allow small time difference due to execution time
+	if ctxDeadline.Sub(deadline).Abs() > time.Millisecond {
+		t.Errorf("Expected deadline %v, got %v", deadline, ctxDeadline)
+	}
+}
