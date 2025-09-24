@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -72,4 +73,46 @@ func BenchmarkStatsAccess(b *testing.B) {
 	})
 
 	g.Wait()
+}
+
+func BenchmarkHighConcurrency(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		g := New()
+
+		counter := int32(0)
+
+		for j := 0; j < 1000; j++ {
+			g.Go(func(ctx context.Context) error {
+				atomic.AddInt32(&counter, 1)
+				return nil
+			})
+		}
+
+		g.Wait()
+	}
+}
+
+func BenchmarkFailFastMode(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		g := New(WithErrorMode(FailFast))
+
+		// First goroutine will fail and cancel others
+		g.Go(func(ctx context.Context) error {
+			return errors.New("fail fast error")
+		})
+
+		// Add many more goroutines that should be cancelled
+		for j := 0; j < 100; j++ {
+			g.Go(func(ctx context.Context) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Second):
+					return nil
+				}
+			})
+		}
+
+		g.Wait()
+	}
 }
