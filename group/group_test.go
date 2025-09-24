@@ -1,6 +1,7 @@
 package group
 
 import (
+	"context"
 	"testing"
 )
 
@@ -21,5 +22,20 @@ func TestNew(t *testing.T) {
 	// Check default configuration
 	if g.config.errorMode != CollectAll {
 		t.Errorf("Expected default error mode %v, got %v", CollectAll, g.config.errorMode)
+	}
+}
+
+func TestNewWithContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	g := NewWithContext(ctx)
+	if g == nil {
+		t.Fatal("NewWithContext() returned nil")
+	}
+
+	g2 := NewWithContext(context.TODO())
+	if g2 == nil {
+		t.Fatal("NewWithContext(context.TODO()) returned nil")
 	}
 }
