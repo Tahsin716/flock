@@ -16,7 +16,7 @@ type Group struct {
 	wg     sync.WaitGroup
 	config Config
 
-	// Error handling - simplified to use single slice
+	// Error handling
 	errors    []error
 	errorsMux sync.RWMutex
 	failOnce  sync.Once
@@ -75,7 +75,7 @@ func NewWithContext(ctx context.Context, opts ...Option) *Group {
 // NewWithTimeout creates a Group with a timeout
 func NewWithTimeout(timeout time.Duration, opts ...Option) *Group {
 	if timeout <= 0 {
-		timeout = time.Second // Reasonable default for invalid timeouts
+		timeout = time.Second
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -171,7 +171,6 @@ func (g *Group) Wait() error {
 		g.errorsMux.RLock()
 		defer g.errorsMux.RUnlock()
 		if len(g.errors) > 0 {
-			// Use errors.Join for Go 1.20+ multi-error support
 			return errors.Join(g.errors...)
 		}
 		return nil

@@ -23,7 +23,7 @@ type Option func(*Config)
 // DefaultConfig returns the default configuration
 func DefaultConfig() Config {
 	return Config{
-		errorMode: CollectAll, // Changed back to CollectAll as it's more common default
+		errorMode: CollectAll,
 	}
 }
 
