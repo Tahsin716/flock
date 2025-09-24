@@ -116,3 +116,81 @@ func BenchmarkFailFastMode(b *testing.B) {
 		g.Wait()
 	}
 }
+
+func BenchmarkPanicRecovery(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		g := New(WithErrorMode(CollectAll))
+
+		// Half the goroutines panic, half succeed
+		for j := 0; j < 10; j++ {
+			j := j
+			g.Go(func(ctx context.Context) error {
+				if j%2 == 0 {
+					panic("benchmark panic")
+				}
+				return nil
+			})
+		}
+
+		g.Wait()
+	}
+}
+
+func BenchmarkContextCancellation(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		g := NewWithContext(ctx)
+
+		started := make(chan struct{})
+
+		// Add goroutines that wait for cancellation
+		for j := 0; j < 50; j++ {
+			if j == 0 {
+				g.Go(func(ctx context.Context) error {
+					close(started)
+					<-ctx.Done()
+					return ctx.Err()
+				})
+			} else {
+				g.Go(func(ctx context.Context) error {
+					<-ctx.Done()
+					return ctx.Err()
+				})
+			}
+		}
+
+		<-started
+		cancel()
+		g.Wait()
+	}
+}
+
+func BenchmarkMemoryAllocation(b *testing.B) {
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		g := New()
+
+		for j := 0; j < 20; j++ {
+			g.Go(func(ctx context.Context) error {
+				return nil
+			})
+		}
+
+		g.Wait()
+	}
+}
+
+func BenchmarkGoSafe(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		g := New()
+
+		for j := 0; j < 10; j++ {
+			g.GoSafe(func() {
+				// Simple work
+			})
+		}
+
+		g.Wait()
+	}
+}
