@@ -141,3 +141,38 @@ func TestGracefulShutdown(t *testing.T) {
 		t.Errorf("Expected all 5 tasks to finish, got %d", atomic.LoadInt32(&finished))
 	}
 }
+
+func TestHighConcurrency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping high concurrency test in short mode")
+	}
+
+	g := New(WithErrorMode(CollectAll))
+
+	const numGoroutines = 1000000
+	counter := int32(0)
+
+	// Launch many goroutines
+	for i := 0; i < numGoroutines; i++ {
+		g.Go(func(ctx context.Context) error {
+			atomic.AddInt32(&counter, 1)
+			// Small random delay to increase race conditions
+			time.Sleep(time.Microsecond * time.Duration(counter%10))
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	if atomic.LoadInt32(&counter) != numGoroutines {
+		t.Errorf("Expected %d executions, got %d", numGoroutines, atomic.LoadInt32(&counter))
+	}
+
+	stats := g.Stats()
+	if stats.Completed != numGoroutines {
+		t.Errorf("Expected %d completed, got %d", numGoroutines, stats.Completed)
+	}
+}
