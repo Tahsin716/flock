@@ -97,7 +97,7 @@ func New[T any](opts ...Option) *Pool[T] {
 		p.workers = append(p.workers, w)
 		p.workerCh <- w // All workers start available
 
-		w.pool.wg.Add(1)
+		p.wg.Add(1)
 		go w.run()
 	}
 
