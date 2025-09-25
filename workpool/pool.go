@@ -53,6 +53,16 @@ type Pool[T any] struct {
 	cleanupInterval time.Duration
 }
 
+// Stats holds pool statistics
+type Stats struct {
+	Capacity  int64 // Maximum workers
+	Available int64 // Available workers
+	Running   int64 // Currently running jobs
+	Submitted int64 // Total submitted jobs
+	Completed int64 // Successfully completed jobs
+	Failed    int64 // Failed jobs
+}
+
 // New creates a new high-performance worker pool
 func New[T any](opts ...Option) *Pool[T] {
 	config := DefaultConfig()
@@ -94,6 +104,42 @@ func New[T any](opts ...Option) *Pool[T] {
 	}
 
 	return p
+}
+
+// Submit submits a job for execution (blocking)
+func (p *Pool[T]) Submit(job Job[T]) error {
+	return p.SubmitWithContext(context.Background(), job)
+}
+
+// SubmitWithContext submits a job with context support (blocking)
+func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) error {
+	if atomic.LoadInt64(&p.closed) == 1 {
+		return ErrPoolClosed
+	}
+
+	atomic.AddInt64(&p.submitted, 1)
+
+	// Fast path: try to get an available worker
+	select {
+	case w := <-p.workerCh:
+		// Got a worker, dispatch job immediately
+		select {
+		case w.jobCh <- job:
+			return nil
+		case <-ctx.Done():
+			// Return worker to pool if context cancelled
+			p.workerCh <- w
+			return ctx.Err()
+		case <-p.stopCh:
+			p.workerCh <- w
+			return ErrPoolClosed
+		}
+
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.stopCh:
+		return ErrPoolClosed
+	}
 }
 
 // cleanupLoop removes idle workers periodically
