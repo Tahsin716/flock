@@ -96,7 +96,7 @@ func New[T any](opts ...Option) *Pool[T] {
 	return p
 }
 
-// cleanupLoop removes idle workers periodically (ants-style feature)
+// cleanupLoop removes idle workers periodically
 func (p *Pool[T]) cleanupLoop() {
 	defer p.wg.Done()
 
