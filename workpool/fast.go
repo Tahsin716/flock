@@ -105,3 +105,19 @@ func (p *FastPool) Submit(task func()) error {
 		return ErrPoolFull
 	}
 }
+
+// TrySubmit attempts non-blocking submission
+func (p *FastPool) TrySubmit(task func()) bool {
+	if atomic.LoadInt64(&p.closed) == 1 {
+		return false
+	}
+
+	select {
+	case w := <-p.workerCh:
+		atomic.AddInt64(&p.submitted, 1)
+		w.taskCh <- task
+		return true
+	default:
+		return false
+	}
+}
