@@ -58,38 +58,6 @@ func NewFast(size int) *FastPool {
 	return p
 }
 
-// fastWorker run loop - optimized for minimal overhead
-func (w *fastWorker) run() {
-	defer w.pool.wg.Done()
-
-	for {
-		select {
-		case task := <-w.taskCh:
-			// Execute task with panic recovery
-			atomic.AddInt64(&w.pool.running, 1)
-			func() {
-				defer func() {
-					atomic.AddInt64(&w.pool.running, -1)
-					if recover() != nil {
-						// Ignore panics in fast mode - just continue
-					}
-				}()
-				task()
-			}()
-
-			// Return to pool immediately
-			select {
-			case w.pool.workerCh <- w:
-			case <-w.pool.stopCh:
-				return
-			}
-
-		case <-w.pool.stopCh:
-			return
-		}
-	}
-}
-
 // Submit submits a function for execution (ants-style interface)
 func (p *FastPool) Submit(task func()) error {
 	if atomic.LoadInt64(&p.closed) == 1 {
@@ -119,5 +87,60 @@ func (p *FastPool) TrySubmit(task func()) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// Close shuts down the pool
+func (p *FastPool) Close() {
+	if atomic.CompareAndSwapInt64(&p.closed, 0, 1) {
+		close(p.stopCh)
+		p.wg.Wait()
+	}
+}
+
+// Running returns number of active workers
+func (p *FastPool) Running() int64 {
+	return atomic.LoadInt64(&p.running)
+}
+
+// Free returns number of available workers
+func (p *FastPool) Free() int {
+	return len(p.workerCh)
+}
+
+// Cap returns pool capacity
+func (p *FastPool) Cap() int {
+	return int(p.capacity)
+}
+
+// fastWorker run loop - optimized for minimal overhead
+func (w *fastWorker) run() {
+	defer w.pool.wg.Done()
+
+	for {
+		select {
+		case task := <-w.taskCh:
+			// Execute task with panic recovery
+			atomic.AddInt64(&w.pool.running, 1)
+			func() {
+				defer func() {
+					atomic.AddInt64(&w.pool.running, -1)
+					if recover() != nil {
+						// Ignore panics in fast mode - just continue
+					}
+				}()
+				task()
+			}()
+
+			// Return to pool immediately
+			select {
+			case w.pool.workerCh <- w:
+			case <-w.pool.stopCh:
+				return
+			}
+
+		case <-w.pool.stopCh:
+			return
+		}
 	}
 }
