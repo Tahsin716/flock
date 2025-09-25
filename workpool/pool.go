@@ -142,6 +142,28 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) error {
 	}
 }
 
+// TrySubmit attempts to submit a job without blocking
+func (p *Pool[T]) TrySubmit(job Job[T]) error {
+	if atomic.LoadInt64(&p.closed) == 1 {
+		return ErrPoolClosed
+	}
+
+	select {
+	case w := <-p.workerCh:
+		atomic.AddInt64(&p.submitted, 1)
+		select {
+		case w.jobCh <- job:
+			return nil
+		default:
+			// This shouldn't happen since we have the worker
+			p.workerCh <- w
+			return ErrWorkerBusy
+		}
+	default:
+		return ErrPoolFull
+	}
+}
+
 // cleanupLoop removes idle workers periodically
 func (p *Pool[T]) cleanupLoop() {
 	defer p.wg.Done()
