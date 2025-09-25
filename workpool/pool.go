@@ -164,6 +164,16 @@ func (p *Pool[T]) TrySubmit(job Job[T]) error {
 	}
 }
 
+// Close gracefully shuts down the pool
+func (p *Pool[T]) Close() {
+	p.closeOnce.Do(func() {
+		atomic.StoreInt64(&p.closed, 1)
+		close(p.stopCh)
+		p.wg.Wait()
+		close(p.results)
+	})
+}
+
 // cleanupLoop removes idle workers periodically
 func (p *Pool[T]) cleanupLoop() {
 	defer p.wg.Done()
