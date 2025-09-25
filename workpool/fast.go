@@ -89,3 +89,19 @@ func (w *fastWorker) run() {
 		}
 	}
 }
+
+// Submit submits a function for execution (ants-style interface)
+func (p *FastPool) Submit(task func()) error {
+	if atomic.LoadInt64(&p.closed) == 1 {
+		return ErrPoolClosed
+	}
+
+	select {
+	case w := <-p.workerCh:
+		atomic.AddInt64(&p.submitted, 1)
+		w.taskCh <- task
+		return nil
+	default:
+		return ErrPoolFull
+	}
+}
