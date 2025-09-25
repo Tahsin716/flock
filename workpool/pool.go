@@ -2,6 +2,7 @@ package workpool
 
 import (
 	"context"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -95,6 +96,9 @@ func New[T any](opts ...Option) *Pool[T] {
 		w.lastUsed = time.Now().UnixNano()
 		p.workers = append(p.workers, w)
 		p.workerCh <- w // All workers start available
+
+		w.pool.wg.Add(1)
+		go w.run()
 	}
 
 	// Start cleanup goroutine for idle workers
@@ -172,6 +176,101 @@ func (p *Pool[T]) Close() {
 		p.wg.Wait()
 		close(p.results)
 	})
+}
+
+// Results returns the results channel
+func (p *Pool[T]) Results() <-chan Result[T] {
+	return p.results
+}
+
+// Capacity returns the maximum number of workers
+func (p *Pool[T]) Capacity() int {
+	return int(p.capacity)
+}
+
+// Available returns the number of available workers
+func (p *Pool[T]) Available() int {
+	return len(p.workerCh)
+}
+
+// Running returns the number of currently running jobs
+func (p *Pool[T]) Running() int64 {
+	return atomic.LoadInt64(&p.running)
+}
+
+// worker run loop
+func (w *worker[T]) run() {
+	defer w.pool.wg.Done()
+
+	for {
+		select {
+		case job := <-w.jobCh:
+			w.execute(job)
+			// Immediately return to pool for reuse
+			select {
+			case w.pool.workerCh <- w:
+				// Successfully returned to pool
+			case <-w.pool.stopCh:
+				return
+			}
+
+		case <-w.pool.stopCh:
+			return
+		}
+	}
+}
+
+// execute runs a job with panic recovery
+func (w *worker[T]) execute(job Job[T]) {
+	// Update last used time
+	atomic.StoreInt64(&w.lastUsed, time.Now().UnixNano())
+
+	// Track running job
+	atomic.AddInt64(&w.pool.running, 1)
+	defer atomic.AddInt64(&w.pool.running, -1)
+
+	// Get result object from pool
+	result := w.pool.resultPool.Get().(*Result[T])
+	defer func() {
+		// Send result and return object to pool
+		select {
+		case w.pool.results <- *result:
+		case <-w.pool.stopCh:
+		default:
+			// Results channel full, drop result
+		}
+
+		// Reset and return to pool
+		var zero T
+		result.Value = zero
+		result.Error = nil
+		w.pool.resultPool.Put(result)
+	}()
+
+	// Execute with panic recovery
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				atomic.AddInt64(&w.pool.failed, 1)
+				result.Error = &PanicError{
+					Value: r,
+					Stack: string(debug.Stack()),
+				}
+				var zero T
+				result.Value = zero
+			}
+		}()
+
+		value, err := job(context.Background())
+		result.Value = value
+		result.Error = err
+
+		if err != nil {
+			atomic.AddInt64(&w.pool.failed, 1)
+		} else {
+			atomic.AddInt64(&w.pool.completed, 1)
+		}
+	}()
 }
 
 // cleanupLoop removes idle workers periodically
