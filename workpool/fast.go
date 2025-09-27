@@ -75,19 +75,14 @@ func (p *FastPool) Close() {
 	})
 }
 
-// Running returns number of active workers
-func (p *FastPool) Running() int64 {
-	return atomic.LoadInt64(&p.running)
-}
-
-// Free returns number of available workers
-func (p *FastPool) Free() int {
-	return len(p.workerCh)
-}
-
-// Cap returns pool capacity
-func (p *FastPool) Cap() int {
-	return int(p.capacity)
+// Stats returns current statistics about the Pool.
+func (p *FastPool) Stats() Stats {
+	return Stats{
+		Submitted: atomic.LoadInt64(&p.submitted),
+		Running:   atomic.LoadInt64(&p.running),
+		Completed: atomic.LoadInt64(&p.completed),
+		Failed:    atomic.LoadInt64(&p.failed),
+	}
 }
 
 // workerLoop is the main execution loop for a fast pool worker.
