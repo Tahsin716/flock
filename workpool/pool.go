@@ -63,6 +63,11 @@ func New[T any](opts ...Option) *Pool[T] {
 		opt(&config)
 	}
 
+	// Validate configuration to ensure min is not greater than max.
+	if config.MinWorkers > config.MaxWorkers {
+		config.MinWorkers = config.MaxWorkers
+	}
+
 	p := &Pool[T]{
 		workerCh:    make(chan *worker[T], config.MaxWorkers),
 		results:     make(chan Result[T], config.ResultBuffer),
@@ -119,9 +124,14 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 		// No idle worker, try to scale or wait.
 	}
 
-	// Scaling path: if we are not at max capacity, create a new worker.
-	if current := atomic.LoadInt32(&p.currentWorkers); current < p.maxWorkers {
-		// Use CompareAndSwap to ensure we don't exceed maxWorkers in a race.
+	// Scaling path: loop to robustly attempt creating a new worker.
+	for {
+		current := atomic.LoadInt32(&p.currentWorkers)
+		if current >= p.maxWorkers {
+			// Pool is at capacity, break to slow path.
+			break
+		}
+		// Attempt to increment the worker count.
 		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
 			atomic.AddInt64(&p.submitted, 1)
 			p.wg.Add(1)
@@ -133,6 +143,7 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 			w.jobCh <- jwc // Give the job to the new worker.
 			return
 		}
+		// CAS failed, another goroutine changed the count. Loop again.
 	}
 
 	// Slow path: pool is at max capacity, wait for an available worker.
@@ -249,12 +260,18 @@ func (w *worker[T]) run() {
 			idleTimer.Reset(w.pool.maxIdleTime)
 
 		case <-idleTimer.C:
-			// Worker has been idle for too long. Check if we can scale down.
-			if current := atomic.LoadInt32(&w.pool.currentWorkers); current > w.pool.minWorkers {
+			// Loop to robustly attempt to scale down.
+			for {
+				current := atomic.LoadInt32(&w.pool.currentWorkers)
+				if current <= w.pool.minWorkers {
+					// Cannot scale down further.
+					break
+				}
 				if atomic.CompareAndSwapInt32(&w.pool.currentWorkers, current, current-1) {
-					// Successfully decremented count, self-terminate.
+					// Successfully terminated self.
 					return
 				}
+				// CAS failed, another goroutine changed the worker count. Loop to retry.
 			}
 			// We are at min workers (or failed the CAS), so stay alive.
 			idleTimer.Reset(w.pool.maxIdleTime)
