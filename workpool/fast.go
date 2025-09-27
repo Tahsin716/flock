@@ -21,6 +21,7 @@ type FastPool struct {
 
 	// Lifecycle
 	closeOnce sync.Once
+	drainOnce sync.Once
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 }
@@ -90,13 +91,18 @@ func (p *FastPool) workerLoop() {
 	defer p.wg.Done()
 	for {
 		select {
-		case task := <-p.workerCh:
+		case task, ok := <-p.workerCh:
+			if !ok {
+				// Channel is closed and drained, worker can exit.
+				return
+			}
 			p.execute(task)
 		case <-p.stopCh:
-			// Drain any remaining tasks after the pool is closed.
-			for task := range p.workerCh {
-				p.execute(task)
-			}
+			// The pool is closing.
+			// Close the worker channel
+			p.drainOnce.Do(func() {
+				close(p.workerCh)
+			})
 			return
 		}
 	}
