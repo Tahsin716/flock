@@ -5,63 +5,60 @@ import (
 	"time"
 )
 
-// Option configures a Group
+// Option configures a Pool.
 type Option func(*Config)
 
-// Config holds pool configuration options
+// Config holds all configuration options for a dynamic pool.
 type Config struct {
-	MaxWorkers      int
-	ResultBuffer    int
-	MaxIdleTime     time.Duration
-	CleanupInterval time.Duration
+	MinWorkers   int           // Minimum number of workers to keep alive.
+	MaxWorkers   int           // Maximum number of workers the pool can scale to.
+	ResultBuffer int           // The size of the buffered results channel.
+	MaxIdleTime  time.Duration // Time a worker can be idle before self-terminating.
 }
 
-// DefaultConfig returns sensible defaults
+// DefaultConfig returns a sensible default configuration.
 func DefaultConfig() Config {
+	gomaxprocs := runtime.GOMAXPROCS(0)
 	return Config{
-		MaxWorkers:      runtime.GOMAXPROCS(0) * 2,
-		ResultBuffer:    100,
-		MaxIdleTime:     10 * time.Second,
-		CleanupInterval: 30 * time.Second,
+		MinWorkers:   gomaxprocs,
+		MaxWorkers:   gomaxprocs * 4,
+		ResultBuffer: 100,
+		MaxIdleTime:  10 * time.Second,
 	}
 }
 
-// WithMaxWorkers sets the maximum workers
-func WithMaxWorkers(worker int) Option {
+// WithMinWorkers sets the minimum number of workers.
+func WithMinWorkers(min int) Option {
 	return func(c *Config) {
-		if worker <= 0 {
-			worker = runtime.GOMAXPROCS(0) * 2
+		if min > 0 {
+			c.MinWorkers = min
 		}
-		c.MaxWorkers = worker
 	}
 }
 
-// WithResultBuffer sets the total result buffer
-func WithResultBuffer(buffer int) Option {
+// WithMaxWorkers sets the maximum number of workers.
+func WithMaxWorkers(max int) Option {
 	return func(c *Config) {
-		if buffer <= 0 {
-			buffer = 100
+		if max > 0 {
+			c.MaxWorkers = max
 		}
-		c.ResultBuffer = buffer
 	}
 }
 
-// WithMaxIdleTime sets the maximum idle time for a goroutine
+// WithResultBuffer sets the buffer size for the results channel.
+func WithResultBuffer(size int) Option {
+	return func(c *Config) {
+		if size > 0 {
+			c.ResultBuffer = size
+		}
+	}
+}
+
+// WithMaxIdleTime sets the duration a worker can be idle before exiting.
 func WithMaxIdleTime(t time.Duration) Option {
 	return func(c *Config) {
-		if t <= 0 {
-			t = 10 * time.Second
+		if t > 0 {
+			c.MaxIdleTime = t
 		}
-		c.MaxIdleTime = t
-	}
-}
-
-// WithCleanupInterval sets the time interval purge idle goroutines
-func WithCleanupInterval(t time.Duration) Option {
-	return func(c *Config) {
-		if t <= 0 {
-			t = 10 * time.Second
-		}
-		c.CleanupInterval = t
 	}
 }
