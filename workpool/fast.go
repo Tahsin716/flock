@@ -1,101 +1,78 @@
 package workpool
 
 import (
+	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 )
 
-// FastPool is an ultra-high-performance pool for fire-and-forget functions
+// FastPool is a high-performance, fixed-size pool for fire-and-forget tasks.
 type FastPool struct {
-	workers  []*fastWorker
-	workerCh chan *fastWorker
+	workerCh chan func() // Task channel for all workers.
 	capacity int32
 
 	// Statistics
 	submitted int64
 	running   int64
+	completed int64
+	failed    int64
 
 	// Lifecycle
-	closed int64
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	closeOnce sync.Once
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
 }
 
-// fastWorker is optimized for minimal overhead
-type fastWorker struct {
-	taskCh chan func()
-	pool   *FastPool
-}
-
-// NewFast creates an ultra-fast pool for fire-and-forget tasks
+// NewFast creates an ultra-fast, fixed-size pool for fire-and-forget tasks.
+// Panics in submitted tasks are recovered and logged to stderr.
 func NewFast(size int) *FastPool {
 	if size <= 0 {
-		size = runtime.GOMAXPROCS(0) * 4
+		size = runtime.GOMAXPROCS(0)
 	}
 
 	p := &FastPool{
-		workers:  make([]*fastWorker, 0, size),
-		workerCh: make(chan *fastWorker, size),
+		workerCh: make(chan func(), size),
 		capacity: int32(size),
 		stopCh:   make(chan struct{}),
 	}
 
-	// Pre-allocate all workers
+	p.wg.Add(size)
 	for i := 0; i < size; i++ {
-		w := &fastWorker{
-			taskCh: make(chan func(), 1),
-			pool:   p,
-		}
-		p.workers = append(p.workers, w)
-		p.workerCh <- w
-
-		// Start worker goroutine
-		p.wg.Add(1)
-		go w.run()
+		go p.workerLoop()
 	}
 
 	return p
 }
 
-// Submit submits a function for execution (ants-style interface)
-func (p *FastPool) Submit(task func()) error {
-	if atomic.LoadInt64(&p.closed) == 1 {
-		return ErrPoolClosed
-	}
-
+// Submit enqueues a task for execution, blocking if the pool's queue is full.
+func (p *FastPool) Submit(task func()) {
 	select {
-	case w := <-p.workerCh:
+	case p.workerCh <- task:
 		atomic.AddInt64(&p.submitted, 1)
-		w.taskCh <- task
-		return nil
-	default:
-		return ErrPoolFull
+	case <-p.stopCh:
 	}
 }
 
-// TrySubmit attempts non-blocking submission
+// TrySubmit attempts to enqueue a task without blocking.
+// It returns true if the task was submitted, and false if the pool's queue is full.
 func (p *FastPool) TrySubmit(task func()) bool {
-	if atomic.LoadInt64(&p.closed) == 1 {
-		return false
-	}
-
 	select {
-	case w := <-p.workerCh:
+	case p.workerCh <- task:
 		atomic.AddInt64(&p.submitted, 1)
-		w.taskCh <- task
 		return true
 	default:
 		return false
 	}
 }
 
-// Close shuts down the pool
+// Close gracefully shuts down the pool, waiting for all active tasks to finish.
 func (p *FastPool) Close() {
-	if atomic.CompareAndSwapInt64(&p.closed, 0, 1) {
+	p.closeOnce.Do(func() {
 		close(p.stopCh)
 		p.wg.Wait()
-	}
+	})
 }
 
 // Running returns number of active workers
@@ -113,34 +90,35 @@ func (p *FastPool) Cap() int {
 	return int(p.capacity)
 }
 
-// fastWorker run loop - optimized for minimal overhead
-func (w *fastWorker) run() {
-	defer w.pool.wg.Done()
-
+// workerLoop is the main execution loop for a fast pool worker.
+func (p *FastPool) workerLoop() {
+	defer p.wg.Done()
 	for {
 		select {
-		case task := <-w.taskCh:
-			// Execute task with panic recovery
-			atomic.AddInt64(&w.pool.running, 1)
-			func() {
-				defer func() {
-					atomic.AddInt64(&w.pool.running, -1)
-					if recover() != nil {
-						// Ignore panics in fast mode - just continue
-					}
-				}()
-				task()
-			}()
-
-			// Return to pool immediately
-			select {
-			case w.pool.workerCh <- w:
-			case <-w.pool.stopCh:
-				return
+		case task := <-p.workerCh:
+			p.execute(task)
+		case <-p.stopCh:
+			// Drain any remaining tasks after the pool is closed.
+			for task := range p.workerCh {
+				p.execute(task)
 			}
-
-		case <-w.pool.stopCh:
 			return
 		}
 	}
+}
+
+// execute runs a task with panic recovery.
+func (p *FastPool) execute(task func()) {
+	atomic.AddInt64(&p.running, 1)
+	defer atomic.AddInt64(&p.running, -1)
+
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&p.failed, 1)
+			fmt.Printf("workpool: panic recovered in FastPool: %v\n%s\n", r, debug.Stack())
+		} else {
+			atomic.AddInt64(&p.completed, 1)
+		}
+	}()
+	task()
 }

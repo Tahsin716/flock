@@ -17,14 +17,6 @@ type Result[T any] struct {
 	Error error
 }
 
-// Stats holds pool statistics
-type Stats struct {
-	Running   int64 // Currently running jobs
-	Submitted int64 // Total submitted jobs
-	Completed int64 // Successfully completed jobs
-	Failed    int64 // Failed jobs
-}
-
 // jobWithContext is an internal struct to bundle a job with its context.
 type jobWithContext[T any] struct {
 	ctx context.Context
