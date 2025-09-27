@@ -114,13 +114,13 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 		// Silently drop if closed to avoid panic
 		return
 	}
-	atomic.AddInt64(&p.submitted, 1)
 
 	jwc := jobWithContext[T]{ctx: ctx, job: job}
 
 	// Fast path: try to get an idle worker.
 	select {
 	case w := <-p.workerCh:
+		atomic.AddInt64(&p.submitted, 1)
 		w.jobCh <- jwc
 		return
 	default:
@@ -128,10 +128,10 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 	}
 
 	// Scaling path: if we are not at max capacity, create a new worker.
-	// Use a non-blocking check with an atomic load.
-	if atomic.LoadInt32(&p.currentWorkers) < p.maxWorkers {
+	if current := atomic.LoadInt32(&p.currentWorkers); current < p.maxWorkers {
 		// Use CompareAndSwap to ensure we don't exceed maxWorkers in a race.
-		if atomic.CompareAndSwapInt32(&p.currentWorkers, atomic.LoadInt32(&p.currentWorkers), atomic.LoadInt32(&p.currentWorkers)+1) {
+		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
+			atomic.AddInt64(&p.submitted, 1)
 			p.wg.Add(1)
 			w := &worker[T]{
 				pool:  p,
@@ -146,9 +146,10 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 	// Slow path: pool is at max capacity, wait for an available worker.
 	select {
 	case w := <-p.workerCh:
+		atomic.AddInt64(&p.submitted, 1)
 		w.jobCh <- jwc
 	case <-p.stopCh:
-		// Pool was closed while waiting.
+		// Pool was closed while waiting. Job is not submitted.
 	}
 }
 
@@ -173,8 +174,8 @@ func (p *Pool[T]) TrySubmit(job Job[T]) bool {
 	}
 
 	// Scaling path: try to create a new worker without blocking.
-	if atomic.LoadInt32(&p.currentWorkers) < p.maxWorkers {
-		if atomic.CompareAndSwapInt32(&p.currentWorkers, atomic.LoadInt32(&p.currentWorkers), atomic.LoadInt32(&p.currentWorkers)+1) {
+	if current := atomic.LoadInt32(&p.currentWorkers); current < p.maxWorkers {
+		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
 			atomic.AddInt64(&p.submitted, 1)
 			p.wg.Add(1)
 			w := &worker[T]{
@@ -257,13 +258,13 @@ func (w *worker[T]) run() {
 
 		case <-idleTimer.C:
 			// Worker has been idle for too long. Check if we can scale down.
-			if atomic.LoadInt32(&w.pool.currentWorkers) > w.pool.minWorkers {
-				if atomic.CompareAndSwapInt32(&w.pool.currentWorkers, atomic.LoadInt32(&w.pool.currentWorkers), atomic.LoadInt32(&w.pool.currentWorkers)-1) {
+			if current := atomic.LoadInt32(&w.pool.currentWorkers); current > w.pool.minWorkers {
+				if atomic.CompareAndSwapInt32(&w.pool.currentWorkers, current, current-1) {
 					// Successfully decremented count, self-terminate.
 					return
 				}
 			}
-			// We are at min workers (or failed the Compare And Swap), so stay alive.
+			// We are at min workers (or failed the CAS), so stay alive.
 			idleTimer.Reset(w.pool.maxIdleTime)
 
 		case <-w.pool.stopCh:
@@ -281,6 +282,12 @@ func (w *worker[T]) execute(jwc jobWithContext[T]) {
 	result := w.pool.resultPool.Get().(*Result[T])
 
 	defer func() {
+		if result.Error != nil {
+			atomic.AddInt64(&w.pool.failed, 1)
+		} else {
+			atomic.AddInt64(&w.pool.completed, 1)
+		}
+
 		// Send the result to the results channel.
 		select {
 		case w.pool.results <- *result:
@@ -299,24 +306,13 @@ func (w *worker[T]) execute(jwc jobWithContext[T]) {
 	// Panic recovery.
 	defer func() {
 		if r := recover(); r != nil {
-			atomic.AddInt64(&w.pool.failed, 1)
 			result.Error = &PanicError{
 				Value: r,
 				Stack: string(debug.Stack()),
 			}
-			var zero T
-			result.Value = zero
 		}
 	}()
 
-	// Use the context that was passed with the job
-	value, err := jwc.job(jwc.ctx)
-	result.Value = value
-	result.Error = err
-
-	if err != nil {
-		atomic.AddInt64(&w.pool.failed, 1)
-	} else {
-		atomic.AddInt64(&w.pool.completed, 1)
-	}
+	// Execute the job.
+	result.Value, result.Error = jwc.job(jwc.ctx)
 }
