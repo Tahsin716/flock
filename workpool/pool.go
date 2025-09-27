@@ -17,6 +17,14 @@ type Result[T any] struct {
 	Error error
 }
 
+// Stats holds pool statistics
+type Stats struct {
+	Running   int64 // Currently running jobs
+	Submitted int64 // Total submitted jobs
+	Completed int64 // Successfully completed jobs
+	Failed    int64 // Failed jobs
+}
+
 // jobWithContext is an internal struct to bundle a job with its context.
 type jobWithContext[T any] struct {
 	ctx context.Context
@@ -54,14 +62,6 @@ type Pool[T any] struct {
 
 	// Configuration
 	maxIdleTime time.Duration
-}
-
-// Stats holds pool statistics
-type Stats struct {
-	Running   int64 // Currently running jobs
-	Submitted int64 // Total submitted jobs
-	Completed int64 // Successfully completed jobs
-	Failed    int64 // Failed jobs
 }
 
 // New creates a new dynamic worker pool with the given options.
@@ -152,6 +152,45 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 	}
 }
 
+// TrySubmit attempts to enqueue a job for execution without blocking.
+// It returns true if the job was successfully submitted, and false otherwise.
+// A job will not be submitted if the pool is at maximum capacity and all workers are busy.
+func (p *Pool[T]) TrySubmit(job Job[T]) bool {
+	if p.isClosed() {
+		return false
+	}
+
+	jwc := jobWithContext[T]{ctx: context.Background(), job: job}
+
+	// Fast path: try to get an idle worker without blocking.
+	select {
+	case w := <-p.workerCh:
+		atomic.AddInt64(&p.submitted, 1)
+		w.jobCh <- jwc
+		return true
+	default:
+		// No idle worker, fall through to scaling path.
+	}
+
+	// Scaling path: try to create a new worker without blocking.
+	if atomic.LoadInt32(&p.currentWorkers) < p.maxWorkers {
+		if atomic.CompareAndSwapInt32(&p.currentWorkers, atomic.LoadInt32(&p.currentWorkers), atomic.LoadInt32(&p.currentWorkers)+1) {
+			atomic.AddInt64(&p.submitted, 1)
+			p.wg.Add(1)
+			w := &worker[T]{
+				pool:  p,
+				jobCh: make(chan jobWithContext[T], 1),
+			}
+			go w.run()
+			w.jobCh <- jwc
+			return true
+		}
+	}
+
+	// If both paths fail, the pool is saturated. Return false.
+	return false
+}
+
 // Results returns the read-only channel for job outcomes.
 // If the result channel buffer is full, new results will be dropped.
 func (p *Pool[T]) Results() <-chan Result[T] {
@@ -167,7 +206,7 @@ func (p *Pool[T]) Close() {
 	})
 }
 
-// Stats returns current statistics about the Group
+// Stats returns current statistics about the Pool.
 func (p *Pool[T]) Stats() Stats {
 	return Stats{
 		Submitted: atomic.LoadInt64(&p.submitted),
@@ -191,15 +230,18 @@ func (w *worker[T]) run() {
 	defer w.pool.wg.Done()
 	idleTimer := time.NewTimer(w.pool.maxIdleTime)
 	defer idleTimer.Stop()
-	atomic.AddInt64(&w.pool.running, 1)
-	defer atomic.AddInt64(&w.pool.running, -1)
 
 	for {
 		select {
 		case jwc := <-w.jobCh:
 			// Stop the idle timer, we have work to do.
 			if !idleTimer.Stop() {
-				<-idleTimer.C // Drain timer if it fired.
+				// Drain timer if it fired while we were waiting for a job.
+				// This is a safe way to handle a timer that might have already expired.
+				select {
+				case <-idleTimer.C:
+				default:
+				}
 			}
 
 			w.execute(jwc)
@@ -221,7 +263,7 @@ func (w *worker[T]) run() {
 					return
 				}
 			}
-			// We are at min workers, so stay alive.
+			// We are at min workers (or failed the Compare And Swap), so stay alive.
 			idleTimer.Reset(w.pool.maxIdleTime)
 
 		case <-w.pool.stopCh:
@@ -233,6 +275,9 @@ func (w *worker[T]) run() {
 
 // execute runs a single job and handles its result and panic recovery.
 func (w *worker[T]) execute(jwc jobWithContext[T]) {
+	atomic.AddInt64(&w.pool.running, 1)
+	defer atomic.AddInt64(&w.pool.running, -1)
+
 	result := w.pool.resultPool.Get().(*Result[T])
 
 	defer func() {
