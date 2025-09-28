@@ -158,6 +158,11 @@ func (p *Pool[T]) Stats() Stats {
 	}
 }
 
+// Cap returns current workers of the pool.
+func (p *Pool[T]) Cap() int {
+	return int(atomic.LoadInt32(&p.currentWorkers))
+}
+
 // idle is the worker's state when it has no work. It waits for a job,
 // times out, or receives a shutdown signal. It returns false if the worker should exit.
 func (w *worker[T]) idle() bool {

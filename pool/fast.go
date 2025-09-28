@@ -105,7 +105,7 @@ func (p *FastPool) Stats() Stats {
 
 // Cap returns pool capacity.
 func (p *FastPool) Cap() int {
-	return int(p.capacity)
+	return int(atomic.LoadInt32(&p.capacity))
 }
 
 // workerLoop is the main execution loop for a worker. It exits when the tasks
