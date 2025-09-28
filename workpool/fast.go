@@ -76,6 +76,10 @@ func (p *FastPool) Close() {
 	})
 }
 
+func (p *FastPool) Cap() int {
+	return int(p.capacity)
+}
+
 // Stats returns current statistics about the Pool.
 func (p *FastPool) Stats() Stats {
 	return Stats{
@@ -103,6 +107,11 @@ func (p *FastPool) workerLoop() {
 			p.drainOnce.Do(func() {
 				close(p.workerCh)
 			})
+
+			// Now, this worker joins the others in draining the closed channel.
+			for task := range p.workerCh {
+				p.execute(task)
+			}
 			return
 		}
 	}
