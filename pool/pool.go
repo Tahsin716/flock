@@ -95,17 +95,6 @@ func New[T any](opts ...Option) *Pool[T] {
 	return p
 }
 
-// startWorker creates and starts a new worker goroutine.
-func (p *Pool[T]) startWorker() {
-	atomic.AddInt32(&p.currentWorkers, 1)
-	p.wg.Add(1)
-	w := &worker[T]{
-		pool:  p,
-		jobCh: make(chan jobItem[T], 1),
-	}
-	go w.run()
-}
-
 // Submit enqueues a job for execution using a background context.
 func (p *Pool[T]) Submit(job Job[T]) {
 	p.SubmitWithContext(context.Background(), job)
@@ -215,6 +204,17 @@ func (p *Pool[T]) Stats() Stats {
 		Completed: atomic.LoadInt64(&p.completed),
 		Failed:    atomic.LoadInt64(&p.failed),
 	}
+}
+
+// startWorker creates and starts a new worker goroutine.
+func (p *Pool[T]) startWorker() {
+	atomic.AddInt32(&p.currentWorkers, 1)
+	p.wg.Add(1)
+	w := &worker[T]{
+		pool:  p,
+		jobCh: make(chan jobItem[T], 1),
+	}
+	go w.run()
 }
 
 // startWorkerAndGiveJob is a helper to encapsulate creating a worker and giving it its first job.
