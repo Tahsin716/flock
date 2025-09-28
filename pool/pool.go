@@ -17,8 +17,8 @@ type Result[T any] struct {
 	Error error
 }
 
-// jobWithContext is an internal struct to bundle a job with its context.
-type jobWithContext[T any] struct {
+// jobItem bundles a job with its context for internal queuing.
+type jobItem[T any] struct {
 	ctx context.Context
 	job Job[T]
 }
@@ -26,20 +26,25 @@ type jobWithContext[T any] struct {
 // worker is a goroutine that executes jobs. It can self-terminate when idle.
 type worker[T any] struct {
 	pool  *Pool[T]
-	jobCh chan jobWithContext[T]
+	jobCh chan jobItem[T] // Private channel for direct handoff of jobs.
 }
 
-// Pool is a high-performance, dynamic worker pool that scales automatically.
+// Pool is a high-performance, dynamic worker pool that scales automatically
+// and buffers jobs when at maximum capacity.
 type Pool[T any] struct {
-	// Worker management
-	workerCh       chan *worker[T] // Channel of available workers.
-	minWorkers     int32
-	maxWorkers     int32
+	// Configuration
+	minWorkers  int32
+	maxWorkers  int32
+	maxIdleTime time.Duration
+
+	// Core components for the hybrid "Buffered Handoff" model
+	workerCh       chan *worker[T] // The "breakroom" for idle workers awaiting direct handoff.
+	jobs           chan jobItem[T] // The central "overflow" queue for when all workers are busy.
+	results        chan Result[T]
 	currentWorkers int32 // Atomic counter for the current number of workers.
 
-	// Result handling
-	results    chan Result[T]
-	resultPool sync.Pool // Recycles Result objects to reduce allocations.
+	// Utilities
+	resultPool sync.Pool
 
 	// Statistics - all atomic for lock-free access
 	submitted int64
@@ -48,12 +53,10 @@ type Pool[T any] struct {
 	failed    int64
 
 	// Lifecycle management
+	ctx       context.Context
+	cancel    context.CancelFunc
 	closeOnce sync.Once
-	stopCh    chan struct{}
 	wg        sync.WaitGroup
-
-	// Configuration
-	maxIdleTime time.Duration
 }
 
 // New creates a new dynamic worker pool with the given options.
@@ -63,151 +66,160 @@ func New[T any](opts ...Option) *Pool[T] {
 		opt(&config)
 	}
 
-	// Validate configuration to ensure min is not greater than max.
 	if config.MinWorkers > config.MaxWorkers {
 		config.MinWorkers = config.MaxWorkers
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	p := &Pool[T]{
-		workerCh:    make(chan *worker[T], config.MaxWorkers),
-		results:     make(chan Result[T], config.ResultBuffer),
-		stopCh:      make(chan struct{}),
 		minWorkers:  int32(config.MinWorkers),
 		maxWorkers:  int32(config.MaxWorkers),
 		maxIdleTime: config.MaxIdleTime,
+		workerCh:    make(chan *worker[T], config.MaxWorkers),
+		jobs:        make(chan jobItem[T], config.ResultBuffer),
+		results:     make(chan Result[T], config.ResultBuffer),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
-	// Initialize the pool for recycling Result structs.
 	p.resultPool.New = func() any {
 		return &Result[T]{}
 	}
 
 	// Pre-start the minimum number of workers.
 	for i := 0; i < config.MinWorkers; i++ {
-		p.wg.Add(1)
-		atomic.AddInt32(&p.currentWorkers, 1)
-		w := &worker[T]{
-			pool:  p,
-			jobCh: make(chan jobWithContext[T], 1),
-		}
-		go w.run()
-		p.workerCh <- w // Add the new worker to the available channel.
+		p.startWorker()
 	}
 
 	return p
 }
 
-// Submit enqueues a job for execution, blocking if the pool is at max capacity.
-// It uses a background context.
+// startWorker creates and starts a new worker goroutine.
+func (p *Pool[T]) startWorker() {
+	atomic.AddInt32(&p.currentWorkers, 1)
+	p.wg.Add(1)
+	w := &worker[T]{
+		pool:  p,
+		jobCh: make(chan jobItem[T], 1),
+	}
+	go w.run()
+}
+
+// Submit enqueues a job for execution using a background context.
 func (p *Pool[T]) Submit(job Job[T]) {
 	p.SubmitWithContext(context.Background(), job)
 }
 
-// SubmitWithContext enqueues a job with a specific context.
-// It will block if the pool is at maximum capacity until a worker is free.
-// It may spin up a new worker if the pool is below maximum capacity.
+// SubmitWithContext enqueues a job with a specific context, using the Buffered Handoff strategy.
 func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
-	if p.isClosed() {
-		// Silently drop if closed to avoid panic
+	item := jobItem[T]{ctx: ctx, job: job}
+
+	select {
+	case <-p.ctx.Done(): // Check if pool is closed first.
 		return
+	default:
 	}
 
-	jwc := jobWithContext[T]{ctx: ctx, job: job}
-
-	// Fast path: try to get an idle worker.
+	// FAST PATH (Handoff): Try to give the job to an idle worker.
 	select {
 	case w := <-p.workerCh:
 		atomic.AddInt64(&p.submitted, 1)
-		w.jobCh <- jwc
+		w.jobCh <- item
 		return
 	default:
-		// No idle worker, try to scale or wait.
 	}
 
-	// Scaling path: loop to robustly attempt creating a new worker.
+	// SCALING PATH: If no idle workers, try to create a new one.
 	for {
 		current := atomic.LoadInt32(&p.currentWorkers)
 		if current >= p.maxWorkers {
-			// Pool is at capacity, break to slow path.
-			break
+			break // At max capacity.
 		}
-		// Attempt to increment the worker count.
 		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
 			atomic.AddInt64(&p.submitted, 1)
-			p.wg.Add(1)
-			w := &worker[T]{
-				pool:  p,
-				jobCh: make(chan jobWithContext[T], 1),
-			}
-			go w.run()
-			w.jobCh <- jwc // Give the job to the new worker.
+			p.startWorkerAndGiveJob(item)
 			return
 		}
-		// CAS failed, another goroutine changed the count. Loop again.
 	}
 
-	// Slow path: pool is at max capacity, wait for an available worker.
+	// BUFFERING PATH: Pool is saturated, place job in the central queue.
 	select {
-	case w := <-p.workerCh:
+	case p.jobs <- item:
 		atomic.AddInt64(&p.submitted, 1)
-		w.jobCh <- jwc
-	case <-p.stopCh:
-		// Pool was closed while waiting. Job is not submitted.
+	case <-p.ctx.Done(): // Pool was closed while we were trying to buffer.
 	}
 }
 
 // TrySubmit attempts to enqueue a job for execution without blocking.
-// It returns true if the job was successfully submitted, and false otherwise.
-// A job will not be submitted if the pool is at maximum capacity and all workers are busy.
 func (p *Pool[T]) TrySubmit(job Job[T]) bool {
-	if p.isClosed() {
+	item := jobItem[T]{ctx: context.Background(), job: job}
+
+	select {
+	case <-p.ctx.Done():
 		return false
+	default:
 	}
 
-	jwc := jobWithContext[T]{ctx: context.Background(), job: job}
-
-	// Fast path: try to get an idle worker without blocking.
+	// FAST PATH (Handoff): Try to give the job to an idle worker.
 	select {
 	case w := <-p.workerCh:
 		atomic.AddInt64(&p.submitted, 1)
-		w.jobCh <- jwc
+		w.jobCh <- item
 		return true
 	default:
-		// No idle worker, fall through to scaling path.
 	}
 
-	// Scaling path: try to create a new worker without blocking.
-	if current := atomic.LoadInt32(&p.currentWorkers); current < p.maxWorkers {
+	// SCALING PATH: Try to create a new worker without blocking.
+	current := atomic.LoadInt32(&p.currentWorkers)
+	if current < p.maxWorkers {
 		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
 			atomic.AddInt64(&p.submitted, 1)
-			p.wg.Add(1)
-			w := &worker[T]{
-				pool:  p,
-				jobCh: make(chan jobWithContext[T], 1),
-			}
-			go w.run()
-			w.jobCh <- jwc
+			p.startWorkerAndGiveJob(item)
 			return true
 		}
 	}
 
-	// If both paths fail, the pool is saturated. Return false.
+	// BUFFERING PATH: Try to place job in the central queue without blocking.
+	select {
+	case p.jobs <- item:
+		atomic.AddInt64(&p.submitted, 1)
+		return true
+	default:
+	}
+
 	return false
 }
 
-// Results returns the read-only channel for job outcomes.
-// If the result channel buffer is full, new results will be dropped.
-func (p *Pool[T]) Results() <-chan Result[T] {
-	return p.results
+// startWorkerAndGiveJob is a helper to encapsulate creating a worker and giving it its first job.
+func (p *Pool[T]) startWorkerAndGiveJob(item jobItem[T]) {
+	p.wg.Add(1)
+	w := &worker[T]{
+		pool:  p,
+		jobCh: make(chan jobItem[T], 1),
+	}
+	w.jobCh <- item
+	go w.run()
 }
 
-// Close gracefully shuts down the pool, waiting for all active jobs to finish.
+// Close gracefully shuts down the pool.
 func (p *Pool[T]) Close() {
 	p.closeOnce.Do(func() {
-		close(p.stopCh)
+		p.cancel()
 		p.wg.Wait()
+		close(p.jobs)
+		// Drain remaining results after all workers are done
+		go func() {
+			for range p.results {
+			}
+		}()
 		close(p.results)
 	})
+}
+
+// Results returns the read-only channel for job outcomes.
+func (p *Pool[T]) Results() <-chan Result[T] {
+	return p.results
 }
 
 // Stats returns current statistics about the Pool.
@@ -220,108 +232,100 @@ func (p *Pool[T]) Stats() Stats {
 	}
 }
 
-func (p *Pool[T]) isClosed() bool {
-	select {
-	case <-p.stopCh:
-		return true
-	default:
-		return false
-	}
-}
-
-// worker's main execution loop.
+// run is the main loop for a worker goroutine.
 func (w *worker[T]) run() {
 	defer w.pool.wg.Done()
 	idleTimer := time.NewTimer(w.pool.maxIdleTime)
 	defer idleTimer.Stop()
 
+	// Handle the initial job if this worker was created via startWorkerAndGiveJob
+	select {
+	case item := <-w.jobCh:
+		w.execute(item)
+	default:
+	}
+
 	for {
+		// Priority 1: Check the central overflow queue for work.
 		select {
-		case jwc := <-w.jobCh:
-			// Stop the idle timer, we have work to do.
+		case item, ok := <-w.pool.jobs:
+			if !ok {
+				// The central queue is closed, which only happens on shutdown.
+				return
+			}
+			w.execute(item)
+			continue // Immediately check for more buffered work.
+		default:
+			// Central queue is empty, proceed to idle state.
+		}
+
+		// The worker is now idle. It places itself in the breakroom.
+		select {
+		case w.pool.workerCh <- w:
+			// Worker is now available for a fast-path handoff.
+		case <-w.pool.ctx.Done():
+			return // Pool closed while trying to become idle.
+		}
+
+		// Wait for either a direct-handoff job or for the idle timer to fire.
+		select {
+		case item := <-w.jobCh:
+			// Got a direct-handoff job.
 			if !idleTimer.Stop() {
-				// Drain timer if it fired while we were waiting for a job.
-				// This is a safe way to handle a timer that might have already expired.
+				// Safely drain the timer
 				select {
 				case <-idleTimer.C:
 				default:
 				}
 			}
-
-			w.execute(jwc)
-
-			// Return worker to the pool for reuse.
-			select {
-			case w.pool.workerCh <- w:
-			case <-w.pool.stopCh:
-				// Pool is closing, exit.
-				return
-			}
+			w.execute(item)
 			idleTimer.Reset(w.pool.maxIdleTime)
 
 		case <-idleTimer.C:
-			// Loop to robustly attempt to scale down.
+			// Idle timeout fired. Attempt to scale down.
 			for {
 				current := atomic.LoadInt32(&w.pool.currentWorkers)
 				if current <= w.pool.minWorkers {
-					// Cannot scale down further.
-					break
+					break // Cannot scale down further.
 				}
 				if atomic.CompareAndSwapInt32(&w.pool.currentWorkers, current, current-1) {
-					// Successfully terminated self.
-					return
+					return // Successfully terminated self.
 				}
-				// CAS failed, another goroutine changed the worker count. Loop to retry.
 			}
-			// We are at min workers (or failed the CAS), so stay alive.
 			idleTimer.Reset(w.pool.maxIdleTime)
 
-		case <-w.pool.stopCh:
-			// Pool is closing, exit.
-			return
+		case <-w.pool.ctx.Done():
+			return // Pool is closing.
 		}
 	}
 }
 
 // execute runs a single job and handles its result and panic recovery.
-func (w *worker[T]) execute(jwc jobWithContext[T]) {
+func (w *worker[T]) execute(item jobItem[T]) {
 	atomic.AddInt64(&w.pool.running, 1)
 	defer atomic.AddInt64(&w.pool.running, -1)
 
 	result := w.pool.resultPool.Get().(*Result[T])
-
 	defer func() {
 		if result.Error != nil {
 			atomic.AddInt64(&w.pool.failed, 1)
 		} else {
 			atomic.AddInt64(&w.pool.completed, 1)
 		}
-
-		// Send the result to the results channel.
 		select {
 		case w.pool.results <- *result:
-		case <-w.pool.stopCh: // Don't block if pool is closing
-		default:
-			// Drop result if the results channel is full.
+		case <-w.pool.ctx.Done():
+		default: // Drop if results channel is full and pool is not closing
 		}
-
-		// Reset and return the Result object to the sync.Pool.
-		var zero T
-		result.Value = zero
-		result.Error = nil
+		*result = Result[T]{}
 		w.pool.resultPool.Put(result)
 	}()
 
-	// Panic recovery.
 	defer func() {
 		if r := recover(); r != nil {
-			result.Error = &PanicError{
-				Value: r,
-				Stack: string(debug.Stack()),
-			}
+			result.Error = &PanicError{Value: r, Stack: string(debug.Stack())}
 		}
 	}()
 
-	// Execute the job.
-	result.Value, result.Error = jwc.job(jwc.ctx)
+	result.Value, result.Error = item.job(item.ctx)
 }
