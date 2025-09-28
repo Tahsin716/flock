@@ -100,84 +100,36 @@ func (p *Pool[T]) Submit(job Job[T]) {
 	p.SubmitWithContext(context.Background(), job)
 }
 
-// SubmitWithContext enqueues a job with a specific context, using the Buffered Handoff strategy.
+// SubmitWithContext enqueues a job with a specific context.
 func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
+	if p.ctx.Err() != nil {
+		return
+	}
 	item := jobItem[T]{ctx: ctx, job: job}
 
-	select {
-	case <-p.ctx.Done(): // Check if pool is closed first.
+	// First, try to hand off the job to an idle worker or scale up.
+	if p.tryHandoffAndScale(item) {
 		return
-	default:
 	}
 
-	// Try to give the job to an idle worker.
-	select {
-	case w := <-p.workerCh:
-		atomic.AddInt64(&p.submitted, 1)
-		w.jobCh <- item
-		return
-	default:
-	}
-
-	// If no idle workers, try to create a new one.
-	for {
-		current := atomic.LoadInt32(&p.currentWorkers)
-		if current >= p.maxWorkers {
-			break // At max capacity.
-		}
-		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
-			atomic.AddInt64(&p.submitted, 1)
-			p.startWorkerAndGiveJob(item)
-			return
-		}
-	}
-
-	// Pool is saturated, place job in the central queue.
-	select {
-	case p.jobs <- item:
-		atomic.AddInt64(&p.submitted, 1)
-	case <-p.ctx.Done(): // Pool was closed while we were trying to buffer.
-	}
+	// If that fails, buffer the job.
+	p.bufferJob(item)
 }
 
 // TrySubmit attempts to enqueue a job for execution without blocking.
 func (p *Pool[T]) TrySubmit(job Job[T]) bool {
+	if p.ctx.Err() != nil {
+		return false
+	}
 	item := jobItem[T]{ctx: context.Background(), job: job}
 
-	select {
-	case <-p.ctx.Done():
-		return false
-	default:
-	}
-
-	// Try to give the job to an idle worker.
-	select {
-	case w := <-p.workerCh:
-		atomic.AddInt64(&p.submitted, 1)
-		w.jobCh <- item
+	// Try a non-blocking handoff or scale-up.
+	if p.tryHandoffAndScale(item) {
 		return true
-	default:
 	}
 
-	// Try to create a new worker without blocking.
-	current := atomic.LoadInt32(&p.currentWorkers)
-	if current < p.maxWorkers {
-		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
-			atomic.AddInt64(&p.submitted, 1)
-			p.startWorkerAndGiveJob(item)
-			return true
-		}
-	}
-
-	// Try to place job in the central queue without blocking.
-	select {
-	case p.jobs <- item:
-		atomic.AddInt64(&p.submitted, 1)
-		return true
-	default:
-	}
-
-	return false
+	// If that fails, try to buffer without blocking.
+	return p.tryBufferJob(item)
 }
 
 // Close gracefully shuts down the pool.
@@ -206,6 +158,41 @@ func (p *Pool[T]) Stats() Stats {
 	}
 }
 
+// idle is the worker's state when it has no work. It waits for a job,
+// times out, or receives a shutdown signal. It returns false if the worker should exit.
+func (w *worker[T]) idle() bool {
+	idleTimer := time.NewTimer(w.pool.maxIdleTime)
+	defer idleTimer.Stop()
+
+	// Place self in the idle worker "breakroom".
+	select {
+	case w.pool.workerCh <- w:
+		// Now available for direct handoff.
+	case <-w.pool.ctx.Done():
+		return false // Pool closed.
+	}
+
+	// Wait for a job, an idle timeout, or shutdown.
+	select {
+	case item := <-w.jobCh:
+		w.execute(item)
+		return true // Continue working.
+	case <-idleTimer.C:
+		// Idle timeout fired. Attempt to scale down.
+		for {
+			current := atomic.LoadInt32(&w.pool.currentWorkers)
+			if current <= w.pool.minWorkers {
+				return true // Cannot scale down, continue working.
+			}
+			if atomic.CompareAndSwapInt32(&w.pool.currentWorkers, current, current-1) {
+				return false // Successfully terminated self.
+			}
+		}
+	case <-w.pool.ctx.Done():
+		return false // Pool closed.
+	}
+}
+
 // startWorker creates and starts a new worker goroutine.
 func (p *Pool[T]) startWorker() {
 	atomic.AddInt32(&p.currentWorkers, 1)
@@ -228,13 +215,57 @@ func (p *Pool[T]) startWorkerAndGiveJob(item jobItem[T]) {
 	go w.run()
 }
 
+// tryHandoffAndScale attempts to give a job to an idle worker or create a new one.
+// It returns true on success.
+func (p *Pool[T]) tryHandoffAndScale(item jobItem[T]) bool {
+	// Fast path: try to get an idle worker.
+	select {
+	case w := <-p.workerCh:
+		atomic.AddInt64(&p.submitted, 1)
+		w.jobCh <- item
+		return true
+	default:
+	}
+
+	// Scaling path: if no idle workers, try to create a new one.
+	for {
+		current := atomic.LoadInt32(&p.currentWorkers)
+		if current >= p.maxWorkers {
+			return false // Cannot scale further.
+		}
+		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
+			atomic.AddInt64(&p.submitted, 1)
+			p.startWorkerAndGiveJob(item)
+			return true
+		}
+	}
+}
+
+// bufferJob places a job in the central queue, blocking if it's full.
+func (p *Pool[T]) bufferJob(item jobItem[T]) {
+	select {
+	case p.jobs <- item:
+		atomic.AddInt64(&p.submitted, 1)
+	case <-p.ctx.Done():
+	}
+}
+
+// tryBufferJob attempts to place a job in the central queue without blocking.
+func (p *Pool[T]) tryBufferJob(item jobItem[T]) bool {
+	select {
+	case p.jobs <- item:
+		atomic.AddInt64(&p.submitted, 1)
+		return true
+	default:
+		return false
+	}
+}
+
 // run is the main loop for a worker goroutine.
 func (w *worker[T]) run() {
 	defer w.pool.wg.Done()
-	idleTimer := time.NewTimer(w.pool.maxIdleTime)
-	defer idleTimer.Stop()
 
-	// Handle the initial job if this worker was created via startWorkerAndGiveJob
+	// Handle the initial job if this worker was created to handle one immediately.
 	select {
 	case item := <-w.jobCh:
 		w.execute(item)
@@ -246,52 +277,17 @@ func (w *worker[T]) run() {
 		select {
 		case item, ok := <-w.pool.jobs:
 			if !ok {
-				// The central queue is closed, which only happens on shutdown.
-				return
+				return // Pool is closing.
 			}
 			w.execute(item)
-			continue // Immediately check for more buffered work.
+			continue // Immediately re-check the central queue.
 		default:
 			// Central queue is empty, proceed to idle state.
 		}
 
-		// The worker is now idle. It places itself in the breakroom.
-		select {
-		case w.pool.workerCh <- w:
-			// Worker is now available for a fast-path handoff.
-		case <-w.pool.ctx.Done():
-			return // Pool closed while trying to become idle.
-		}
-
-		// Wait for either a direct-handoff job or for the idle timer to fire.
-		select {
-		case item := <-w.jobCh:
-			// Got a direct-handoff job.
-			if !idleTimer.Stop() {
-				// Safely drain the timer
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			w.execute(item)
-			idleTimer.Reset(w.pool.maxIdleTime)
-
-		case <-idleTimer.C:
-			// Idle timeout fired. Attempt to scale down.
-			for {
-				current := atomic.LoadInt32(&w.pool.currentWorkers)
-				if current <= w.pool.minWorkers {
-					break // Cannot scale down further.
-				}
-				if atomic.CompareAndSwapInt32(&w.pool.currentWorkers, current, current-1) {
-					return // Successfully terminated self.
-				}
-			}
-			idleTimer.Reset(w.pool.maxIdleTime)
-
-		case <-w.pool.ctx.Done():
-			return // Pool is closing.
+		// The worker is now idle and must wait for new work or a signal to shut down.
+		if !w.idle() {
+			return // idle() returned false, indicating a shutdown.
 		}
 	}
 }
