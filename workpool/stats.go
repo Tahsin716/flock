@@ -1,4 +1,4 @@
-package workpool
+package pool
 
 // Stats holds pool statistics
 type Stats struct {
