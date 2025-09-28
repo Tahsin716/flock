@@ -77,3 +77,79 @@ func TestPoolSubmitAndResults(t *testing.T) {
 		t.Errorf("Stats are incorrect after jobs, got %+v", stats)
 	}
 }
+
+func TestPoolScaling(t *testing.T) {
+	p := New[bool](WithMinWorkers(1), WithMaxWorkers(3), WithMaxIdleTime(50*time.Millisecond))
+	defer p.Close()
+
+	if atomic.LoadInt32(&p.currentWorkers) != 1 {
+		t.Fatalf("Initial worker count should be 1, got %d", atomic.LoadInt32(&p.currentWorkers))
+	}
+
+	// Force scaling up to max
+	for i := 0; i < 3; i++ {
+		p.Submit(newTestJob(100*time.Millisecond, false))
+	}
+
+	time.Sleep(20 * time.Millisecond) // Give time for scaling to occur
+	if atomic.LoadInt32(&p.currentWorkers) != 3 {
+		t.Fatalf("Pool did not scale up to 3 workers, got %d", atomic.LoadInt32(&p.currentWorkers))
+	}
+
+	// Wait for jobs to finish and idle time to pass for scale down
+	time.Sleep(200 * time.Millisecond)
+
+	if atomic.LoadInt32(&p.currentWorkers) != 1 {
+		t.Errorf("Pool did not scale down to 1 worker, got %d", atomic.LoadInt32(&p.currentWorkers))
+	}
+}
+
+func TestPoolTrySubmit(t *testing.T) {
+	p := New[bool](WithMinWorkers(1), WithMaxWorkers(1)) // Fixed size for testing saturation
+	defer p.Close()
+
+	// First submit should succeed and occupy the only worker
+	if !p.TrySubmit(newTestJob(100*time.Millisecond, false)) {
+		t.Fatal("First TrySubmit should have succeeded")
+	}
+
+	// Second submit should fail as the pool is saturated
+	if p.TrySubmit(newTestJob(10*time.Millisecond, false)) {
+		t.Fatal("Second TrySubmit should have failed on a saturated pool")
+	}
+
+	time.Sleep(150 * time.Millisecond) // Wait for the first job to complete
+
+	// Third submit should now succeed
+	if !p.TrySubmit(newTestJob(10*time.Millisecond, false)) {
+		t.Fatal("Third TrySubmit should have succeeded after worker became free")
+	}
+}
+
+func TestPoolPanicHandling(t *testing.T) {
+	p := New[bool]()
+	defer p.Close()
+
+	panicJob := func(ctx context.Context) (bool, error) {
+		panic("test panic")
+	}
+
+	p.Submit(panicJob)
+
+	res := <-p.Results()
+	if res.Error == nil {
+		t.Fatal("Expected an error from a panicking job, but got nil")
+	}
+
+	panicErr, ok := res.Error.(*PanicError)
+	if !ok {
+		t.Fatalf("Expected error to be of type PanicError, but got %T", res.Error)
+	}
+	if panicErr.Value != "test panic" {
+		t.Errorf("Panic value was incorrect, got %v", panicErr.Value)
+	}
+
+	if p.Stats().Failed != 1 {
+		t.Errorf("Failed stats should be 1 after a panic, got %d", p.Stats().Failed)
+	}
+}
