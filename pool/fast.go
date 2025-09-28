@@ -79,7 +79,7 @@ func (p *FastPool) TrySubmit(task func()) bool {
 	case p.tasks <- task:
 		atomic.AddInt64(&p.submitted, 1)
 		return true
-	default: // Includes the case where <-p.ctx.Done() is ready
+	default:
 		return false
 	}
 }
@@ -87,15 +87,8 @@ func (p *FastPool) TrySubmit(task func()) bool {
 // Close shuts down the pool gracefully, ensuring all submitted tasks are executed.
 func (p *FastPool) Close() {
 	p.closeOnce.Do(func() {
-		// 1. Signal that no new tasks will be accepted.
-		//    This makes the preliminary checks in Submit/TrySubmit fail immediately.
 		p.cancel()
-
-		// 2. Now that no new sends can occur, it's safe to close the tasks channel.
-		//    This will signal the workers to finish.
 		close(p.tasks)
-
-		// 3. Wait for all worker goroutines to exit.
 		p.wg.Wait()
 	})
 }

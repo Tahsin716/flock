@@ -121,7 +121,7 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 	default:
 	}
 
-	// FAST PATH (Handoff): Try to give the job to an idle worker.
+	// Try to give the job to an idle worker.
 	select {
 	case w := <-p.workerCh:
 		atomic.AddInt64(&p.submitted, 1)
@@ -130,7 +130,7 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 	default:
 	}
 
-	// SCALING PATH: If no idle workers, try to create a new one.
+	// If no idle workers, try to create a new one.
 	for {
 		current := atomic.LoadInt32(&p.currentWorkers)
 		if current >= p.maxWorkers {
@@ -143,7 +143,7 @@ func (p *Pool[T]) SubmitWithContext(ctx context.Context, job Job[T]) {
 		}
 	}
 
-	// BUFFERING PATH: Pool is saturated, place job in the central queue.
+	// Pool is saturated, place job in the central queue.
 	select {
 	case p.jobs <- item:
 		atomic.AddInt64(&p.submitted, 1)
@@ -161,7 +161,7 @@ func (p *Pool[T]) TrySubmit(job Job[T]) bool {
 	default:
 	}
 
-	// FAST PATH (Handoff): Try to give the job to an idle worker.
+	// Try to give the job to an idle worker.
 	select {
 	case w := <-p.workerCh:
 		atomic.AddInt64(&p.submitted, 1)
@@ -170,7 +170,7 @@ func (p *Pool[T]) TrySubmit(job Job[T]) bool {
 	default:
 	}
 
-	// SCALING PATH: Try to create a new worker without blocking.
+	// Try to create a new worker without blocking.
 	current := atomic.LoadInt32(&p.currentWorkers)
 	if current < p.maxWorkers {
 		if atomic.CompareAndSwapInt32(&p.currentWorkers, current, current+1) {
@@ -180,7 +180,7 @@ func (p *Pool[T]) TrySubmit(job Job[T]) bool {
 		}
 	}
 
-	// BUFFERING PATH: Try to place job in the central queue without blocking.
+	// Try to place job in the central queue without blocking.
 	select {
 	case p.jobs <- item:
 		atomic.AddInt64(&p.submitted, 1)
@@ -191,28 +191,13 @@ func (p *Pool[T]) TrySubmit(job Job[T]) bool {
 	return false
 }
 
-// startWorkerAndGiveJob is a helper to encapsulate creating a worker and giving it its first job.
-func (p *Pool[T]) startWorkerAndGiveJob(item jobItem[T]) {
-	p.wg.Add(1)
-	w := &worker[T]{
-		pool:  p,
-		jobCh: make(chan jobItem[T], 1),
-	}
-	w.jobCh <- item
-	go w.run()
-}
-
 // Close gracefully shuts down the pool.
 func (p *Pool[T]) Close() {
 	p.closeOnce.Do(func() {
 		p.cancel()
 		p.wg.Wait()
+
 		close(p.jobs)
-		// Drain remaining results after all workers are done
-		go func() {
-			for range p.results {
-			}
-		}()
 		close(p.results)
 	})
 }
@@ -230,6 +215,17 @@ func (p *Pool[T]) Stats() Stats {
 		Completed: atomic.LoadInt64(&p.completed),
 		Failed:    atomic.LoadInt64(&p.failed),
 	}
+}
+
+// startWorkerAndGiveJob is a helper to encapsulate creating a worker and giving it its first job.
+func (p *Pool[T]) startWorkerAndGiveJob(item jobItem[T]) {
+	p.wg.Add(1)
+	w := &worker[T]{
+		pool:  p,
+		jobCh: make(chan jobItem[T], 1),
+	}
+	w.jobCh <- item
+	go w.run()
 }
 
 // run is the main loop for a worker goroutine.
