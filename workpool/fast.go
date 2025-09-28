@@ -70,6 +70,15 @@ func (p *FastPool) Submit(task func()) {
 // TrySubmit attempts to enqueue a task without blocking.
 // It returns true if the task was submitted, and false if the pool's queue is full.
 func (p *FastPool) TrySubmit(task func()) bool {
+	// First, check if the pool is closing. This prevents a "send on closed channel" panic.
+	select {
+	case <-p.stopCh:
+		return false // Pool is closed.
+	default:
+		// Pool is not closed, proceed.
+	}
+
+	// Now, try to send the task without blocking.
 	select {
 	case p.workerCh <- task:
 		atomic.AddInt64(&p.submitted, 1)
