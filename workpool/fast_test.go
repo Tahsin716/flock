@@ -136,6 +136,14 @@ func TestFastPoolClose(t *testing.T) {
 	if p.Stats().Submitted != 20 {
 		t.Errorf("Task should not be submitted to a closed pool")
 	}
+
+	// TrySubmit on a closed pool should also be a no-op and return false
+	if p.TrySubmit(task) {
+		t.Error("TrySubmit should return false for a closed pool")
+	}
+	if p.Stats().Submitted != 20 {
+		t.Errorf("Task should not be submitted to a closed pool via TrySubmit")
+	}
 }
 
 func TestFastPoolConcurrency(t *testing.T) {
