@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"runtime/debug"
@@ -9,8 +10,9 @@ import (
 )
 
 // FastPool is a high-performance, fixed-size pool for fire-and-forget tasks.
+// It uses a context for lifecycle management and a single channel for tasks.
 type FastPool struct {
-	workerCh chan func() // Task channel for all workers.
+	tasks    chan func()
 	capacity int32
 
 	// Statistics
@@ -21,24 +23,27 @@ type FastPool struct {
 
 	// Lifecycle
 	closeOnce sync.Once
-	drainOnce sync.Once
-	stopCh    chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 }
 
-// NewFast creates an ultra-fast, fixed-size pool for fire-and-forget tasks.
-// Panics in submitted tasks are recovered and logged to stderr.
+// NewFast creates a fixed-size pool for fire-and-forget tasks.
 func NewFast(size int) *FastPool {
 	if size <= 0 {
 		size = runtime.GOMAXPROCS(0)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	p := &FastPool{
-		workerCh: make(chan func(), size),
+		tasks:    make(chan func(), size),
 		capacity: int32(size),
-		stopCh:   make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
+	// Start workers
 	p.wg.Add(size)
 	for i := 0; i < size; i++ {
 		go p.workerLoop()
@@ -47,60 +52,55 @@ func NewFast(size int) *FastPool {
 	return p
 }
 
-// Submit enqueues a task for execution, blocking if the pool's queue is full.
-func (p *FastPool) Submit(task func()) {
-	select {
-	case <-p.stopCh:
-		// Pool is closed, do nothing and return immediately.
-		return
-	default:
-		// Pool is not closed, proceed to submit.
+// Submit enqueues a task, blocking if the queue is full.
+func (p *FastPool) Submit(task func()) error {
+	// First, check if the pool is closed to prevent a race with Close().
+	if p.ctx.Err() != nil {
+		return ErrPoolClosed
 	}
 
-	// Now we can safely attempt to submit the task.
 	select {
-	case p.workerCh <- task:
+	case p.tasks <- task:
 		atomic.AddInt64(&p.submitted, 1)
-	case <-p.stopCh:
-		// This handles the rare case where the pool was closed in the nanoseconds
-		// between the check above and this select statement.
+		return nil
+	case <-p.ctx.Done():
+		return ErrPoolClosed
 	}
 }
 
 // TrySubmit attempts to enqueue a task without blocking.
-// It returns true if the task was submitted, and false if the pool's queue is full.
 func (p *FastPool) TrySubmit(task func()) bool {
-	// First, check if the pool is closing. This prevents a "send on closed channel" panic.
-	select {
-	case <-p.stopCh:
-		return false // Pool is closed.
-	default:
-		// Pool is not closed, proceed.
+	// First, check if the pool is closed to prevent a race with Close().
+	if p.ctx.Err() != nil {
+		return false
 	}
 
-	// Now, try to send the task without blocking.
 	select {
-	case p.workerCh <- task:
+	case p.tasks <- task:
 		atomic.AddInt64(&p.submitted, 1)
 		return true
-	default:
+	default: // Includes the case where <-p.ctx.Done() is ready
 		return false
 	}
 }
 
-// Close gracefully shuts down the pool, waiting for all active tasks to finish.
+// Close shuts down the pool gracefully, ensuring all submitted tasks are executed.
 func (p *FastPool) Close() {
 	p.closeOnce.Do(func() {
-		close(p.stopCh)
+		// 1. Signal that no new tasks will be accepted.
+		//    This makes the preliminary checks in Submit/TrySubmit fail immediately.
+		p.cancel()
+
+		// 2. Now that no new sends can occur, it's safe to close the tasks channel.
+		//    This will signal the workers to finish.
+		close(p.tasks)
+
+		// 3. Wait for all worker goroutines to exit.
 		p.wg.Wait()
 	})
 }
 
-func (p *FastPool) Cap() int {
-	return int(p.capacity)
-}
-
-// Stats returns current statistics about the Pool.
+// Stats returns current statistics.
 func (p *FastPool) Stats() Stats {
 	return Stats{
 		Submitted: atomic.LoadInt64(&p.submitted),
@@ -110,35 +110,22 @@ func (p *FastPool) Stats() Stats {
 	}
 }
 
-// workerLoop is the main execution loop for a fast pool worker.
+// Cap returns pool capacity.
+func (p *FastPool) Cap() int {
+	return int(p.capacity)
+}
+
+// workerLoop is the main execution loop for a worker. It exits when the tasks
+// channel is closed and drained.
 func (p *FastPool) workerLoop() {
 	defer p.wg.Done()
-	for {
-		select {
-		case task, ok := <-p.workerCh:
-			if !ok {
-				// Channel is closed and drained, worker can exit.
-				return
-			}
-			p.execute(task)
-		case <-p.stopCh:
-			// The pool is closing.
-			// Close the worker channel
-			p.drainOnce.Do(func() {
-				close(p.workerCh)
-			})
-
-			// Now, this worker joins the others in draining the closed channel.
-			for task := range p.workerCh {
-				p.execute(task)
-			}
-			return
-		}
+	for task := range p.tasks {
+		p.executeTask(task)
 	}
 }
 
-// execute runs a task with panic recovery.
-func (p *FastPool) execute(task func()) {
+// executeTask runs a single task with panic recovery and statistics updates.
+func (p *FastPool) executeTask(task func()) {
 	atomic.AddInt64(&p.running, 1)
 	defer atomic.AddInt64(&p.running, -1)
 
@@ -150,5 +137,6 @@ func (p *FastPool) execute(task func()) {
 			atomic.AddInt64(&p.completed, 1)
 		}
 	}()
+
 	task()
 }
