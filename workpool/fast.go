@@ -50,9 +50,20 @@ func NewFast(size int) *FastPool {
 // Submit enqueues a task for execution, blocking if the pool's queue is full.
 func (p *FastPool) Submit(task func()) {
 	select {
+	case <-p.stopCh:
+		// Pool is closed, do nothing and return immediately.
+		return
+	default:
+		// Pool is not closed, proceed to submit.
+	}
+
+	// Now we can safely attempt to submit the task.
+	select {
 	case p.workerCh <- task:
 		atomic.AddInt64(&p.submitted, 1)
 	case <-p.stopCh:
+		// This handles the rare case where the pool was closed in the nanoseconds
+		// between the check above and this select statement.
 	}
 }
 
