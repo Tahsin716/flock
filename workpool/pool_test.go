@@ -2,6 +2,7 @@ package workpool
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,5 +152,80 @@ func TestPoolPanicHandling(t *testing.T) {
 
 	if p.Stats().Failed != 1 {
 		t.Errorf("Failed stats should be 1 after a panic, got %d", p.Stats().Failed)
+	}
+}
+
+func TestPoolClose(t *testing.T) {
+	p := New[bool](WithMinWorkers(2), WithMaxWorkers(4), WithResultBuffer(10))
+	var completedJobs int64
+	numJobs := 10
+
+	for i := 0; i < numJobs; i++ {
+		p.Submit(func(ctx context.Context) (bool, error) {
+			time.Sleep(50 * time.Millisecond)
+			atomic.AddInt64(&completedJobs, 1)
+			return true, nil
+		})
+	}
+
+	time.Sleep(10 * time.Millisecond) // Allow some jobs to start
+	p.Close()                         // Should block until all 10 jobs are done
+
+	if atomic.LoadInt64(&completedJobs) != int64(numJobs) {
+		t.Errorf("Not all jobs were completed before Close returned, completed: %d", completedJobs)
+	}
+
+	// Submitting to a closed pool should be a no-op
+	p.Submit(newTestJob(10*time.Millisecond, false))
+	if p.Stats().Submitted != int64(numJobs) {
+		t.Errorf("Job should not be submitted to a closed pool")
+	}
+
+	// Drain the results channel. Since Close() has returned, we know all jobs
+	// are done and the results channel is now closed.
+	for i := 0; i < numJobs; i++ {
+		<-p.Results()
+	}
+
+	// Now that the channel is drained, a read should confirm it's closed.
+	_, ok := <-p.Results()
+	if ok {
+		t.Error("Results channel should be closed and empty, but a value was received.")
+	}
+}
+
+func TestPoolConcurrency(t *testing.T) {
+	p := New[bool](WithMinWorkers(4), WithMaxWorkers(64), WithResultBuffer(2000))
+	defer p.Close()
+
+	numGoroutines := 100
+	jobsPerGoroutine := 20
+	totalJobs := numGoroutines * jobsPerGoroutine
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < jobsPerGoroutine; j++ {
+				p.Submit(newTestJob(time.Millisecond, false))
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	completed := 0
+	for i := 0; i < totalJobs; i++ {
+		<-p.Results()
+		completed++
+	}
+
+	if completed != totalJobs {
+		t.Errorf("Expected %d completed jobs, got %d", totalJobs, completed)
+	}
+	stats := p.Stats()
+	if stats.Submitted != int64(totalJobs) || stats.Completed != int64(totalJobs) || stats.Failed != 0 {
+		t.Errorf("Stats are incorrect after concurrent execution, got %+v", stats)
 	}
 }
