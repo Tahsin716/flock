@@ -417,3 +417,78 @@ func TestPoolStats(t *testing.T) {
 		t.Errorf("Expected 1 failed, got %d", stats.Failed)
 	}
 }
+
+// Worker scaling tests
+
+func TestPoolWorkerScaling(t *testing.T) {
+	pool := newTestPool[int](
+		WithMinWorkers(1),
+		WithMaxWorkers(4),
+		WithMaxIdleTime(50*time.Millisecond),
+	)
+	defer pool.Close()
+
+	// Submit multiple slow jobs to trigger scaling
+	for i := 0; i < 8; i++ {
+		pool.Submit(slowJob(100*time.Millisecond, i))
+	}
+
+	// Wait a bit for scaling
+	time.Sleep(20 * time.Millisecond)
+
+	// Should have scaled up due to queue pressure
+	stats := pool.Stats()
+	if stats.Running == 0 {
+		t.Error("Expected some workers to be running")
+	}
+
+	// Drain results
+	for i := 0; i < 8; i++ {
+		<-pool.Results()
+	}
+
+	// Wait for idle timeout to trigger scaling down
+	time.Sleep(100 * time.Millisecond)
+}
+
+// Concurrency and race condition tests
+
+func TestPoolConcurrentSubmission(t *testing.T) {
+	pool := newTestPool[int]()
+	defer pool.Close()
+
+	const numGoroutines = 100
+	const jobsPerGoroutine = 10
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < jobsPerGoroutine; j++ {
+				pool.Submit(simpleJob(id*jobsPerGoroutine + j))
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Collect results
+	expectedResults := numGoroutines * jobsPerGoroutine
+	for i := 0; i < expectedResults; i++ {
+		select {
+		case result := <-pool.Results():
+			if result.Error != nil {
+				t.Errorf("Unexpected error in result %d: %v", i, result.Error)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timeout waiting for result %d", i)
+		}
+	}
+
+	stats := pool.Stats()
+	if stats.Submitted != int64(expectedResults) {
+		t.Errorf("Expected %d submitted, got %d", expectedResults, stats.Submitted)
+	}
+}
