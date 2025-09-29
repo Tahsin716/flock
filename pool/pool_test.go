@@ -9,6 +9,46 @@ import (
 	"time"
 )
 
+// Test utilities
+func newTestPool[T any](opts ...Option) *Pool[T] {
+	defaultOpts := []Option{
+		WithMinWorkers(1),
+		WithMaxWorkers(4),
+		WithMaxIdleTime(100 * time.Millisecond),
+		WithResultBuffer(10),
+	}
+	return New[T](append(defaultOpts, opts...)...)
+}
+
+func simpleJob(value int) Job[int] {
+	return func(ctx context.Context) (int, error) {
+		return value, nil
+	}
+}
+
+func errorJob(err error) Job[int] {
+	return func(ctx context.Context) (int, error) {
+		return 0, err
+	}
+}
+
+func slowJob(duration time.Duration, value int) Job[int] {
+	return func(ctx context.Context) (int, error) {
+		select {
+		case <-time.After(duration):
+			return value, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+}
+
+func panicJob() Job[int] {
+	return func(ctx context.Context) (int, error) {
+		panic("test panic")
+	}
+}
+
 // newTestJob is a helper to create a simple job for testing purposes.
 func newTestJob(d time.Duration, shouldErr bool) Job[bool] {
 	return func(ctx context.Context) (bool, error) {
@@ -34,6 +74,48 @@ func TestNewPool(t *testing.T) {
 	}
 	if p.currentWorkers != 2 {
 		t.Errorf("Expected 2 initial workers, got %d", p.currentWorkers)
+	}
+}
+
+func TestPoolBasicSubmission(t *testing.T) {
+	pool := newTestPool[int]()
+	defer pool.Close()
+
+	// Test basic submission
+	pool.Submit(simpleJob(42))
+
+	// Check result
+	select {
+	case result := <-pool.Results():
+		if result.Error != nil {
+			t.Errorf("Unexpected error: %v", result.Error)
+		}
+		if result.Value != 42 {
+			t.Errorf("Expected 42, got %d", result.Value)
+		}
+	case <-time.After(time.Second):
+		t.Error("Timeout waiting for result")
+	}
+}
+
+func TestPoolSubmissionWithContext(t *testing.T) {
+	pool := newTestPool[int]()
+	defer pool.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Submit job that takes longer than context timeout
+	pool.SubmitWithContext(ctx, slowJob(200*time.Millisecond, 42))
+
+	// Should get context cancellation error
+	select {
+	case result := <-pool.Results():
+		if result.Error != context.DeadlineExceeded {
+			t.Errorf("Expected context deadline exceeded, got: %v", result.Error)
+		}
+	case <-time.After(time.Second):
+		t.Error("Timeout waiting for result")
 	}
 }
 
