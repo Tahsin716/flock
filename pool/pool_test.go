@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -314,5 +315,55 @@ func TestPoolConcurrency(t *testing.T) {
 	}
 	if atomic.LoadInt64(&completedJobs) != int64(totalTasks) {
 		t.Errorf("Expected completed to be %d, got %d", totalTasks, atomic.LoadInt64(&completedJobs))
+	}
+}
+
+func TestPoolTrySubmit(t *testing.T) {
+	// Create pool with small buffer to test blocking behavior
+	pool := newTestPool[int](WithResultBuffer(1))
+	defer pool.Close()
+
+	// Fill the queue
+	success := pool.TrySubmit(slowJob(100*time.Millisecond, 1))
+	if !success {
+		t.Error("First TrySubmit should succeed")
+	}
+
+	// This might fail if buffer is full
+	_ = pool.TrySubmit(slowJob(100*time.Millisecond, 2))
+
+	// At least one should complete
+	timeout := time.After(200 * time.Millisecond)
+	resultCount := 0
+	for resultCount < 2 {
+		select {
+		case <-pool.Results():
+			resultCount++
+		case <-timeout:
+			if resultCount == 0 {
+				t.Error("Should have received at least one result")
+			}
+			return
+		}
+	}
+}
+
+func TestPoolErrorHandling(t *testing.T) {
+	pool := newTestPool[int]()
+	defer pool.Close()
+
+	testErr := errors.New("test error")
+	pool.Submit(errorJob(testErr))
+
+	select {
+	case result := <-pool.Results():
+		if result.Error != testErr {
+			t.Errorf("Expected test error, got: %v", result.Error)
+		}
+		if result.Value != 0 {
+			t.Errorf("Expected 0 for error case, got %d", result.Value)
+		}
+	case <-time.After(time.Second):
+		t.Error("Timeout waiting for result")
 	}
 }
