@@ -367,3 +367,53 @@ func TestPoolErrorHandling(t *testing.T) {
 		t.Error("Timeout waiting for result")
 	}
 }
+
+func TestPoolClosedSubmission(t *testing.T) {
+	pool := newTestPool[int]()
+	pool.Close()
+
+	pool.Submit(simpleJob(42))
+
+	result := <-pool.Results()
+	if result.Error != nil {
+		t.Error("Submit should fail on closed pool")
+	}
+
+	success := pool.TrySubmit(simpleJob(42))
+	if success {
+		t.Error("TrySubmit should fail on closed pool")
+	}
+}
+
+func TestPoolStats(t *testing.T) {
+	pool := newTestPool[int]()
+	defer pool.Close()
+
+	// Initial stats
+	stats := pool.Stats()
+	if stats.Submitted != 0 || stats.Running != 0 || stats.Completed != 0 || stats.Failed != 0 {
+		t.Errorf("Expected zero stats initially, got: %+v", stats)
+	}
+
+	// Submit jobs
+	for i := 0; i < 5; i++ {
+		pool.Submit(simpleJob(i))
+	}
+	pool.Submit(errorJob(errors.New("test")))
+
+	// Wait for completion
+	for i := 0; i < 6; i++ {
+		<-pool.Results()
+	}
+
+	stats = pool.Stats()
+	if stats.Submitted != 6 {
+		t.Errorf("Expected 6 submitted, got %d", stats.Submitted)
+	}
+	if stats.Completed != 5 {
+		t.Errorf("Expected 5 completed, got %d", stats.Completed)
+	}
+	if stats.Failed != 1 {
+		t.Errorf("Expected 1 failed, got %d", stats.Failed)
+	}
+}
