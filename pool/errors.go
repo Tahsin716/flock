@@ -21,4 +21,5 @@ var (
 	ErrPoolClosed      = errors.New("pool is closed")
 	ErrPoolOverload    = errors.New("pool is overloaded")
 	ErrInvalidPoolSize = errors.New("invalid pool size")
+	ErrTaskNil         = errors.New("task is nil")
 )

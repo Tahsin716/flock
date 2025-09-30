@@ -88,6 +88,34 @@ func NewPool(size int, opts ...Option) (*Pool, error) {
 	return p, nil
 }
 
+// Submit submits a task to the pool
+func (p *Pool) Submit(task Task) error {
+	if task == nil {
+		return ErrTaskNil
+	}
+
+	if p.IsClosed() {
+		return ErrPoolClosed
+	}
+
+	// Try to get a worker
+	w := p.getWorker()
+	if w == nil {
+		return ErrPoolOverload
+	}
+
+	// Send task to worker
+	select {
+	case w.task <- task:
+		atomic.AddUint64(&p.submitted, 1)
+		return nil
+	case <-time.After(time.Second):
+		// Put worker back and return error
+		p.putWorker(w)
+		return ErrPoolOverload
+	}
+}
+
 // Running returns number of running workers
 func (p *Pool) Running() int {
 	return int(atomic.LoadInt32(&p.running))
@@ -113,9 +141,54 @@ func (p *Pool) Completed() uint64 {
 	return atomic.LoadUint64(&p.completed)
 }
 
+// Tune changes pool capacity
+func (p *Pool) Tune(size int) {
+	if size > 0 {
+		atomic.StoreInt32(&p.capacity, int32(size))
+	}
+}
+
 // IsClosed returns whether pool is closed
 func (p *Pool) IsClosed() bool {
 	return atomic.LoadInt32(&p.state) == StateClosed
+}
+
+// getWorker retrieves or creates a worker
+func (p *Pool) getWorker() *worker {
+	// Fast path: try to get existing worker
+	select {
+	case w := <-p.workers:
+		return w
+	default:
+	}
+
+	// Check if we can create new worker
+	running := atomic.LoadInt32(&p.running)
+	if running >= p.capacity {
+		if p.nonblocking {
+			return nil
+		}
+
+		// Create new worker
+		atomic.AddInt32(&p.running, 1)
+		w := &worker{
+			pool:     p,
+			task:     make(chan Task, 1),
+			lastUsed: time.Now(),
+		}
+		w.start()
+		return w
+
+	}
+
+	// Blocking mode: wait for available worker
+	select {
+	case w := <-p.workers:
+		return w
+	case <-time.After(time.Second):
+		return nil
+	}
+
 }
 
 // putWorker returns a worker to the pool
