@@ -45,3 +45,29 @@ func TestPoolSubmit(t *testing.T) {
 		t.Errorf("Expected counter=10, got %d", counter)
 	}
 }
+
+func TestPoolWithPreAlloc(t *testing.T) {
+	pool, _ := NewPool(5, WithPreAlloc(true))
+	defer pool.Release()
+
+	var counter int32
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		err := pool.Submit(func() {
+			atomic.AddInt32(&counter, 1)
+			wg.Done()
+		})
+		if err != nil {
+			wg.Done()
+			t.Errorf("Submit failed: %v", err)
+		}
+	}
+
+	wg.Wait()
+
+	if counter != 20 {
+		t.Errorf("Expected counter=20, got %d", counter)
+	}
+}
