@@ -305,3 +305,20 @@ func TestPoolNoDeadlock(t *testing.T) {
 		t.Fatal("Deadlock detected")
 	}
 }
+
+func TestPoolReleaseTimeout(t *testing.T) {
+	pool, _ := NewPool(5)
+
+	// Submit long-running tasks
+	for i := 0; i < 3; i++ {
+		pool.Submit(func() {
+			time.Sleep(2 * time.Second)
+		})
+	}
+
+	// Try to release with short timeout
+	err := pool.ReleaseTimeout(100 * time.Millisecond)
+	if err == nil {
+		t.Error("Expected timeout error")
+	}
+}
