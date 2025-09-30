@@ -339,10 +339,35 @@ func TestPoolWithFunc(t *testing.T) {
 	for i := int32(1); i <= 100; i++ {
 		wg.Add(1)
 		pool.Invoke(i)
-		time.Sleep(time.Microsecond) // add small delay for processing
 	}
 
-	expected := int32(5050) // Sum of 1 to 100
+	time.Sleep(time.Millisecond) // add small delay for processing
+	expected := int32(5050)      // Sum of 1 to 100
+	if counter != expected {
+		t.Errorf("Expected counter=%d, got %d", expected, counter)
+	}
+}
+
+func TestPoolWithFuncGeneric(t *testing.T) {
+	var counter int32
+
+	pool, err := NewPoolWithFuncGeneric(5, func(val int32) {
+		atomic.AddInt32(&counter, val)
+	})
+
+	if err != nil {
+		t.Fatalf("Failed to create generic pool: %v", err)
+	}
+	defer pool.Release()
+
+	for i := int32(1); i <= 10; i++ {
+		pool.Invoke(i)
+	}
+
+	// Wait for completion
+	time.Sleep(time.Millisecond)
+
+	expected := int32(55)
 	if counter != expected {
 		t.Errorf("Expected counter=%d, got %d", expected, counter)
 	}
