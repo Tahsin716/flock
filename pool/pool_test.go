@@ -244,3 +244,37 @@ func TestPoolConcurrentSubmit(t *testing.T) {
 		t.Errorf("Expected counter=%d, got %d", expected, counter)
 	}
 }
+
+func TestPoolRaceConditions(t *testing.T) {
+	pool, _ := NewPool(5)
+	defer pool.Release()
+
+	var wg sync.WaitGroup
+
+	// Concurrent submit
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pool.Submit(func() {
+				time.Sleep(time.Millisecond)
+			})
+		}()
+	}
+
+	// Concurrent stats reading
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = pool.Running()
+				_ = pool.Free()
+				_ = pool.Submitted()
+				_ = pool.Completed()
+			}
+		}()
+	}
+
+	wg.Wait()
+}
