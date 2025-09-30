@@ -96,3 +96,29 @@ func TestPoolNonblocking(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestPoolPanicRecovery(t *testing.T) {
+	pool, _ := NewPool(5)
+	defer pool.Release()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Submit task that panics
+	pool.Submit(func() {
+		defer wg.Done()
+		panic("test panic")
+	})
+
+	// Submit normal task - should still work
+	pool.Submit(func() {
+		defer wg.Done()
+	})
+
+	wg.Wait()
+
+	// Pool should still be functional
+	if pool.IsClosed() {
+		t.Error("Pool should not be closed after panic")
+	}
+}
