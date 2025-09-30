@@ -22,3 +22,10 @@ func NewPoolWithFuncGeneric[T any](size int, fn func(T), opts ...Option) (*PoolW
 		fn:   fn,
 	}, nil
 }
+
+// Invoke submits a typed task
+func (p *PoolWithFuncGeneric[T]) Invoke(arg T) error {
+	return p.pool.Submit(func() {
+		p.fn(arg)
+	})
+}
