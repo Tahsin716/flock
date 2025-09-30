@@ -246,10 +246,6 @@ func (p *Pool) getWorker() *worker {
 	// Check if we can create new worker
 	running := atomic.LoadInt32(&p.running)
 	if running < p.capacity {
-		if p.nonblocking {
-			return nil
-		}
-
 		// Create new worker
 		atomic.AddInt32(&p.running, 1)
 		w := &worker{
@@ -260,6 +256,10 @@ func (p *Pool) getWorker() *worker {
 		w.start()
 		return w
 
+	}
+
+	if p.nonblocking {
+		return nil
 	}
 
 	// Blocking mode: wait for available worker

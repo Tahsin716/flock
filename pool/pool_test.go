@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Basic functionality tests
@@ -70,4 +71,28 @@ func TestPoolWithPreAlloc(t *testing.T) {
 	if counter != 20 {
 		t.Errorf("Expected counter=20, got %d", counter)
 	}
+}
+
+func TestPoolNonblocking(t *testing.T) {
+	pool, _ := NewPool(2, WithNonblocking(true))
+	defer pool.Release()
+
+	// Fill the pool with blocking tasks
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	for i := 0; i < 10; i++ {
+		pool.Submit(func() {
+			time.Sleep(100 * time.Millisecond)
+			wg.Done()
+		})
+	}
+
+	// This should fail quickly in nonblocking mode
+	err := pool.Submit(func() {})
+	if err != ErrPoolOverload {
+		t.Errorf("Expected ErrPoolOverload, got %v", err)
+	}
+
+	wg.Wait()
 }
