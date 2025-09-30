@@ -209,3 +209,38 @@ func TestPoolStatistics(t *testing.T) {
 		t.Errorf("Expected %d completed, got %d", taskCount, completed)
 	}
 }
+
+// Concurrency tests
+
+func TestPoolConcurrentSubmit(t *testing.T) {
+	pool, _ := NewPool(10)
+	defer pool.Release()
+
+	const goroutines = 50
+	const tasksPerGoroutine = 20
+
+	var wg sync.WaitGroup
+	var counter int32
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerGoroutine; j++ {
+				pool.Submit(func() {
+					atomic.AddInt32(&counter, 1)
+				})
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Wait for all tasks to complete
+	time.Sleep(100 * time.Millisecond)
+
+	expected := int32(goroutines * tasksPerGoroutine)
+	if counter != expected {
+		t.Errorf("Expected counter=%d, got %d", expected, counter)
+	}
+}
