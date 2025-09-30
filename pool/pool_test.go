@@ -165,3 +165,18 @@ func TestPoolReboot(t *testing.T) {
 	wg.Wait()
 	pool.Release()
 }
+
+func TestPoolTune(t *testing.T) {
+	pool, _ := NewPool(5)
+	defer pool.Release()
+
+	if pool.Cap() != 5 {
+		t.Errorf("Expected capacity 5, got %d", pool.Cap())
+	}
+
+	pool.Tune(10)
+
+	if pool.Cap() != 10 {
+		t.Errorf("Expected capacity 10, got %d", pool.Cap())
+	}
+}
