@@ -136,3 +136,32 @@ func TestPoolClosed(t *testing.T) {
 		t.Error("Pool should be closed")
 	}
 }
+
+func TestPoolReboot(t *testing.T) {
+	pool, _ := NewPool(5)
+	pool.Release()
+
+	if !pool.IsClosed() {
+		t.Error("Pool should be closed")
+	}
+
+	pool.Reboot()
+
+	if pool.IsClosed() {
+		t.Error("Pool should be open after reboot")
+	}
+
+	// Should be able to submit tasks
+	var wg sync.WaitGroup
+	wg.Add(1)
+	err := pool.Submit(func() {
+		wg.Done()
+	})
+
+	if err != nil {
+		t.Errorf("Submit after reboot failed: %v", err)
+	}
+
+	wg.Wait()
+	pool.Release()
+}
