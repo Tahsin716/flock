@@ -174,6 +174,50 @@ func (p *Pool) Release() {
 	p.wg.Wait()
 }
 
+// ReleaseTimeout closes pool with timeout
+func (p *Pool) ReleaseTimeout(timeout time.Duration) error {
+	if p.IsClosed() {
+		return ErrPoolClosed
+	}
+
+	// Mark as closed
+	if !atomic.CompareAndSwapInt32(&p.state, StateRunning, StateClosed) {
+		return ErrPoolClosed
+	}
+
+	// Stop cleanup
+	close(p.stopCleanup)
+
+	// Wait for workers to finish with timeout
+	done := make(chan struct{})
+	go func() {
+		// Wait for all running tasks to complete
+		for p.Running() > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All workers finished
+		close(p.workers)
+		for w := range p.workers {
+			close(w.task)
+		}
+		p.wg.Wait()
+		return nil
+	case <-time.After(timeout):
+		// Timeout - force close
+		close(p.workers)
+		for w := range p.workers {
+			close(w.task)
+		}
+		p.wg.Wait()
+		return ErrReleaseTimeout
+	}
+}
+
 // getWorker retrieves or creates a worker
 func (p *Pool) getWorker() *worker {
 	// Fast path: try to get existing worker
