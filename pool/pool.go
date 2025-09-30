@@ -218,6 +218,21 @@ func (p *Pool) ReleaseTimeout(timeout time.Duration) error {
 	}
 }
 
+// Reboot restarts a closed pool
+func (p *Pool) Reboot() {
+	if atomic.CompareAndSwapInt32(&p.state, StateClosed, StateRunning) {
+		atomic.StoreInt32(&p.running, 0)
+		atomic.StoreUint64(&p.submitted, 0)
+		atomic.StoreUint64(&p.completed, 0)
+		p.workers = make(chan *worker, p.capacity)
+		p.stopCleanup = make(chan struct{})
+
+		// Restart cleanup
+		p.wg.Add(1)
+		go p.cleanupLoop()
+	}
+}
+
 // getWorker retrieves or creates a worker
 func (p *Pool) getWorker() *worker {
 	// Fast path: try to get existing worker
