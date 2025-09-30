@@ -322,3 +322,28 @@ func TestPoolReleaseTimeout(t *testing.T) {
 		t.Error("Expected timeout error")
 	}
 }
+
+func TestPoolWithFunc(t *testing.T) {
+	var counter int32
+
+	pool, err := NewPoolWithFunc(5, func(arg interface{}) {
+		atomic.AddInt32(&counter, arg.(int32))
+	})
+
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Release()
+
+	var wg sync.WaitGroup
+	for i := int32(1); i <= 100; i++ {
+		wg.Add(1)
+		pool.Invoke(i)
+		time.Sleep(time.Microsecond) // add small delay for processing
+	}
+
+	expected := int32(5050) // Sum of 1 to 100
+	if counter != expected {
+		t.Errorf("Expected counter=%d, got %d", expected, counter)
+	}
+}
