@@ -278,3 +278,30 @@ func TestPoolRaceConditions(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestPoolNoDeadlock(t *testing.T) {
+	pool, _ := NewPool(2)
+	defer pool.Release()
+
+	done := make(chan struct{})
+
+	go func() {
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			pool.Submit(func() {
+				time.Sleep(10 * time.Millisecond)
+				wg.Done()
+			})
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(1 * time.Second):
+		t.Fatal("Deadlock detected")
+	}
+}
