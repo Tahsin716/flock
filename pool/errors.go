@@ -18,7 +18,7 @@ func (p *PanicError) Error() string {
 
 // Common errors returned by the pool.
 var (
-	ErrPoolClosed = errors.New("pool is closed")
-	ErrPoolFull   = errors.New("no workers available")
-	ErrWorkerBusy = errors.New("worker is busy")
+	ErrPoolClosed      = errors.New("pool is closed")
+	ErrPoolOverload    = errors.New("pool is overloaded")
+	ErrInvalidPoolSize = errors.New("invalid pool size")
 )

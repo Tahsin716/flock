@@ -1,64 +1,80 @@
 package pool
 
 import (
-	"runtime"
 	"time"
 )
 
-// Option configures a Pool.
-type Option func(*Config)
+// Options configures the pool.
+type Options struct {
+	// ExpiryDuration is the interval for cleaning up idle workers.
+	ExpiryDuration time.Duration
 
-// Config holds all configuration options for a dynamic pool.
-type Config struct {
-	MinWorkers   int           // Minimum number of workers to keep alive.
-	MaxWorkers   int           // Maximum number of workers the pool can scale to.
-	ResultBuffer int           // The size of the buffered results channel.
-	MaxIdleTime  time.Duration // Time a worker can be idle before self-terminating.
+	// PreAlloc indicates whether to pre-allocate workers.
+	PreAlloc bool
+
+	// MaxBlockingTasks limits blocking when submitting tasks.
+	// 0 means unlimited blocking.
+	MaxBlockingTasks int
+
+	// Nonblocking controls whether Submit blocks when pool is full.
+	Nonblocking bool
+
+	// DisablePurge disables automatic cleanup of idle workers.
+	DisablePurge bool
+
+	// Logger for pool events (optional).
+	Logger Logger
 }
 
-// DefaultConfig returns a sensible default configuration.
-func DefaultConfig() Config {
-	gomaxprocs := runtime.GOMAXPROCS(0)
-	return Config{
-		MinWorkers:   gomaxprocs,
-		MaxWorkers:   gomaxprocs * 4,
-		ResultBuffer: 100,
-		MaxIdleTime:  10 * time.Second,
+// Logger interface for custom logging.
+type Logger interface {
+	Printf(format string, args ...interface{})
+}
+
+// DefaultOptions returns sensible defaults.
+func DefaultOptions() Options {
+	return Options{
+		ExpiryDuration: 10 * time.Second,
+		PreAlloc:       false,
+		Nonblocking:    false,
+		DisablePurge:   false,
 	}
 }
 
-// WithMinWorkers sets the minimum number of workers.
-func WithMinWorkers(min int) Option {
-	return func(c *Config) {
-		if min > 0 {
-			c.MinWorkers = min
-		}
+// Option configures a pool.
+type Option func(*Options)
+
+// WithExpiryDuration sets the expiry duration for idle workers.
+func WithExpiryDuration(d time.Duration) Option {
+	return func(o *Options) {
+		o.ExpiryDuration = d
 	}
 }
 
-// WithMaxWorkers sets the maximum number of workers.
-func WithMaxWorkers(max int) Option {
-	return func(c *Config) {
-		if max > 0 {
-			c.MaxWorkers = max
-		}
+// WithPreAlloc enables pre-allocation of workers.
+func WithPreAlloc(preAlloc bool) Option {
+	return func(o *Options) {
+		o.PreAlloc = preAlloc
 	}
 }
 
-// WithResultBuffer sets the buffer size for the results channel.
-func WithResultBuffer(size int) Option {
-	return func(c *Config) {
-		if size > 0 {
-			c.ResultBuffer = size
-		}
+// WithNonblocking enables non-blocking mode.
+func WithNonblocking(nonblocking bool) Option {
+	return func(o *Options) {
+		o.Nonblocking = nonblocking
 	}
 }
 
-// WithMaxIdleTime sets the duration a worker can be idle before exiting.
-func WithMaxIdleTime(t time.Duration) Option {
-	return func(c *Config) {
-		if t > 0 {
-			c.MaxIdleTime = t
-		}
+// WithDisablePurge disables automatic cleanup.
+func WithDisablePurge(disable bool) Option {
+	return func(o *Options) {
+		o.DisablePurge = disable
+	}
+}
+
+// WithLogger sets a custom logger.
+func WithLogger(logger Logger) Option {
+	return func(o *Options) {
+		o.Logger = logger
 	}
 }
