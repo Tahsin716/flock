@@ -1,7 +1,9 @@
 package pool
 
 import (
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,3 +45,178 @@ const (
 	StateClosed int32 = iota
 	StateRunning
 )
+
+// NewPool creates a new worker pool
+func NewPool(size int, opts ...Option) (*Pool, error) {
+	if size <= 0 {
+		size = runtime.GOMAXPROCS(0)
+	}
+
+	// Load options
+	options := DefaultOptions()
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	p := &Pool{
+		capacity:       int32(size),
+		expiryDuration: options.ExpiryDuration,
+		nonblocking:    options.Nonblocking,
+		workers:        make(chan *worker, size),
+		stopCleanup:    make(chan struct{}),
+	}
+
+	// Pre-allocate workers if requested
+	if options.PreAlloc {
+		for i := 0; i < size; i++ {
+			w := &worker{
+				pool:     p,
+				task:     make(chan Task, 1),
+				lastUsed: time.Now(),
+			}
+			p.workers <- w
+			w.start()
+		}
+	}
+
+	// Start cleanup goroutine
+	if !options.DisablePurge {
+		p.wg.Add(1)
+		go p.cleanupLoop()
+	}
+
+	return p, nil
+}
+
+// Running returns number of running workers
+func (p *Pool) Running() int {
+	return int(atomic.LoadInt32(&p.running))
+}
+
+// Free returns number of available worker slots
+func (p *Pool) Free() int {
+	return int(p.capacity) - p.Running()
+}
+
+// Cap returns pool capacity
+func (p *Pool) Cap() int {
+	return int(p.capacity)
+}
+
+// Submitted returns total submitted tasks
+func (p *Pool) Submitted() uint64 {
+	return atomic.LoadUint64(&p.submitted)
+}
+
+// Completed returns total completed tasks
+func (p *Pool) Completed() uint64 {
+	return atomic.LoadUint64(&p.completed)
+}
+
+// IsClosed returns whether pool is closed
+func (p *Pool) IsClosed() bool {
+	return atomic.LoadInt32(&p.state) == 1
+}
+
+// putWorker returns a worker to the pool
+func (p *Pool) putWorker(w *worker) {
+	if p.IsClosed() {
+		atomic.AddInt32(&p.running, -1)
+		close(w.task)
+		return
+	}
+
+	w.lastUsed = time.Now()
+
+	// Try to return worker to pool
+	select {
+	case p.workers <- w:
+		// Successfully returned
+	default:
+		// Pool is full, terminate worker
+		atomic.AddInt32(&p.running, -1)
+		close(w.task)
+	}
+}
+
+// cleanupLoop periodically removes expired workers
+func (p *Pool) cleanupLoop() {
+	defer p.wg.Done()
+
+	ticker := time.NewTicker(p.expiryDuration)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.cleanExpiredWorkers()
+		case <-p.stopCleanup:
+			return
+		}
+	}
+}
+
+// cleanExpiredWorkers removes workers that have been idle too long
+func (p *Pool) cleanExpiredWorkers() {
+	// Only clean if we have idle workers
+	if len(p.workers) == 0 {
+		return
+	}
+
+	expiryTime := time.Now().Add(-p.expiryDuration)
+
+	// Check workers in the channel
+	for i := 0; i < len(p.workers); i++ {
+		select {
+		case w := <-p.workers:
+			if w.lastUsed.Before(expiryTime) && p.Running() > 1 {
+				// Expire this worker
+				atomic.AddInt32(&p.running, -1)
+				close(w.task)
+			} else {
+				// Keep this worker
+				select {
+				case p.workers <- w:
+				default:
+					// Channel full, close worker
+					atomic.AddInt32(&p.running, -1)
+					close(w.task)
+				}
+			}
+		default:
+			return
+		}
+	}
+}
+
+// start begins the worker's execution loop
+func (w *worker) start() {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Panic recovery - just continue
+			}
+		}()
+
+		for task := range w.task {
+			if task == nil {
+				continue
+			}
+
+			// Execute task with panic recovery
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Task panicked, but worker continues
+					}
+				}()
+				task()
+			}()
+
+			atomic.AddUint64(&w.pool.completed, 1)
+
+			// Return worker to pool
+			w.pool.putWorker(w)
+		}
+	}()
+}

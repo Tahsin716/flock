@@ -21,14 +21,6 @@ type Options struct {
 
 	// DisablePurge disables automatic cleanup of idle workers.
 	DisablePurge bool
-
-	// Logger for pool events (optional).
-	Logger Logger
-}
-
-// Logger interface for custom logging.
-type Logger interface {
-	Printf(format string, args ...interface{})
 }
 
 // DefaultOptions returns sensible defaults.
@@ -69,12 +61,5 @@ func WithNonblocking(nonblocking bool) Option {
 func WithDisablePurge(disable bool) Option {
 	return func(o *Options) {
 		o.DisablePurge = disable
-	}
-}
-
-// WithLogger sets a custom logger.
-func WithLogger(logger Logger) Option {
-	return func(o *Options) {
-		o.Logger = logger
 	}
 }
