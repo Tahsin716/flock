@@ -180,3 +180,32 @@ func TestPoolTune(t *testing.T) {
 		t.Errorf("Expected capacity 10, got %d", pool.Cap())
 	}
 }
+
+func TestPoolStatistics(t *testing.T) {
+	pool, _ := NewPool(5)
+	defer pool.Release()
+
+	var wg sync.WaitGroup
+	const taskCount = 50
+
+	for i := 0; i < taskCount; i++ {
+		wg.Add(1)
+		pool.Submit(func() {
+			time.Sleep(10 * time.Millisecond)
+			wg.Done()
+		})
+	}
+
+	wg.Wait()
+
+	submitted := pool.Submitted()
+	completed := pool.Completed()
+
+	if submitted != taskCount {
+		t.Errorf("Expected %d submitted, got %d", taskCount, submitted)
+	}
+
+	if completed != taskCount {
+		t.Errorf("Expected %d completed, got %d", taskCount, completed)
+	}
+}
