@@ -323,6 +323,8 @@ func TestPoolReleaseTimeout(t *testing.T) {
 	}
 }
 
+// PoolWithFunc tests
+
 func TestPoolWithFunc(t *testing.T) {
 	var counter int32
 
@@ -347,6 +349,8 @@ func TestPoolWithFunc(t *testing.T) {
 		t.Errorf("Expected counter=%d, got %d", expected, counter)
 	}
 }
+
+// Pool with Generic test
 
 func TestPoolWithFuncGeneric(t *testing.T) {
 	var counter int32
