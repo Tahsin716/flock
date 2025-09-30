@@ -122,3 +122,17 @@ func TestPoolPanicRecovery(t *testing.T) {
 		t.Error("Pool should not be closed after panic")
 	}
 }
+
+func TestPoolClosed(t *testing.T) {
+	pool, _ := NewPool(5)
+	pool.Release()
+
+	err := pool.Submit(func() {})
+	if err != ErrPoolClosed {
+		t.Errorf("Expected ErrPoolClosed, got %v", err)
+	}
+
+	if !pool.IsClosed() {
+		t.Error("Pool should be closed")
+	}
+}
