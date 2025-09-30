@@ -115,7 +115,7 @@ func (p *Pool) Completed() uint64 {
 
 // IsClosed returns whether pool is closed
 func (p *Pool) IsClosed() bool {
-	return atomic.LoadInt32(&p.state) == 1
+	return atomic.LoadInt32(&p.state) == StateClosed
 }
 
 // putWorker returns a worker to the pool
