@@ -64,6 +64,7 @@ func NewPool(size int, opts ...Option) (*Pool, error) {
 		nonblocking:    options.Nonblocking,
 		workers:        make(chan *worker, size),
 		stopCleanup:    make(chan struct{}),
+		state:          1,
 	}
 
 	// Pre-allocate workers if requested
@@ -244,7 +245,7 @@ func (p *Pool) getWorker() *worker {
 
 	// Check if we can create new worker
 	running := atomic.LoadInt32(&p.running)
-	if running >= p.capacity {
+	if running < p.capacity {
 		if p.nonblocking {
 			return nil
 		}
