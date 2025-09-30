@@ -23,4 +23,5 @@ var (
 	ErrInvalidPoolSize = errors.New("invalid pool size")
 	ErrTaskNil         = errors.New("task is nil")
 	ErrReleaseTimeout  = errors.New("release timeout")
+	ErrFuncNil         = errors.New("function is nil")
 )
