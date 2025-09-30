@@ -22,3 +22,10 @@ func NewPoolWithFunc(size int, fn func(interface{}), opts ...Option) (*PoolWithF
 		fn:   fn,
 	}, nil
 }
+
+// Invoke submits a task with argument
+func (p *PoolWithFunc) Invoke(arg interface{}) error {
+	return p.pool.Submit(func() {
+		p.fn(arg)
+	})
+}
