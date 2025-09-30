@@ -153,6 +153,27 @@ func (p *Pool) IsClosed() bool {
 	return atomic.LoadInt32(&p.state) == StateClosed
 }
 
+// Release closes the pool gracefully
+func (p *Pool) Release() {
+	if !atomic.CompareAndSwapInt32(&p.state, StateRunning, StateClosed) {
+		return // Already closed
+	}
+
+	// Stop cleanup
+	close(p.stopCleanup)
+
+	// Close all worker channels
+	close(p.workers)
+
+	// Drain worker channel and close all workers
+	for w := range p.workers {
+		close(w.task)
+	}
+
+	// Wait for cleanup goroutine
+	p.wg.Wait()
+}
+
 // getWorker retrieves or creates a worker
 func (p *Pool) getWorker() *worker {
 	// Fast path: try to get existing worker
