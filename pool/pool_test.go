@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -305,5 +306,50 @@ func TestPriorityPool(t *testing.T) {
 	// Normal and low should complete before blocked high
 	if len(order) < 2 {
 		t.Error("Expected at least 2 tasks to complete")
+	}
+}
+
+// ============================================================================
+// ContextPool Tests
+// ============================================================================
+
+func TestContextPool(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := NewContextPool(ctx, 5)
+	defer pool.Close()
+
+	var started int32
+	var completed int32
+
+	// Start long-running tasks
+	for i := 0; i < 5; i++ {
+		pool.GoCtx(func(ctx context.Context) error {
+			atomic.AddInt32(&started, 1)
+			select {
+			case <-time.After(time.Second):
+				atomic.AddInt32(&completed, 1)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		})
+	}
+
+	// Wait for tasks to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Cancel context
+	cancel()
+
+	// Wait a bit
+	time.Sleep(50 * time.Millisecond)
+
+	if atomic.LoadInt32(&started) == 0 {
+		t.Error("Expected tasks to start")
+	}
+
+	// Tasks should not complete (cancelled)
+	if atomic.LoadInt32(&completed) > 0 {
+		t.Error("Tasks should be cancelled, not completed")
 	}
 }
