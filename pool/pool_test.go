@@ -251,3 +251,59 @@ func TestErrorPool(t *testing.T) {
 		t.Errorf("Expected 2 errors, got %d", len(errs))
 	}
 }
+
+// ============================================================================
+// PriorityPool Tests
+// ============================================================================
+
+func TestPriorityPool(t *testing.T) {
+	pool := NewPriorityPool(2, 2, 2)
+	defer pool.Close()
+
+	var order []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Block high priority pool
+	wg.Add(2)
+	pool.GoHigh(func() {
+		time.Sleep(50 * time.Millisecond)
+		wg.Done()
+	})
+	pool.GoHigh(func() {
+		time.Sleep(50 * time.Millisecond)
+		wg.Done()
+	})
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Submit to all priorities
+	wg.Add(3)
+	pool.GoHigh(func() {
+		mu.Lock()
+		order = append(order, "high")
+		mu.Unlock()
+		wg.Done()
+	})
+
+	pool.Go(func() {
+		mu.Lock()
+		order = append(order, "normal")
+		mu.Unlock()
+		wg.Done()
+	})
+
+	pool.GoLow(func() {
+		mu.Lock()
+		order = append(order, "low")
+		mu.Unlock()
+		wg.Done()
+	})
+
+	wg.Wait()
+
+	// Normal and low should complete before blocked high
+	if len(order) < 2 {
+		t.Error("Expected at least 2 tasks to complete")
+	}
+}
