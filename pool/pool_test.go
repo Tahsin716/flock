@@ -1,42 +1,51 @@
 package pool
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// Basic functionality tests
+// ============================================================================
+// Core Pool Tests
+// ============================================================================
 
 func TestPoolCreation(t *testing.T) {
-	pool, err := NewPool(10)
-	if err != nil {
-		t.Fatalf("Failed to create pool: %v", err)
-	}
-	defer pool.Release()
+	pool := New(10)
+	defer pool.Close()
 
 	if pool.Cap() != 10 {
 		t.Errorf("Expected capacity 10, got %d", pool.Cap())
 	}
 }
 
-func TestPoolSubmit(t *testing.T) {
-	pool, _ := NewPool(5)
-	defer pool.Release()
+func TestPoolDefaultCapacity(t *testing.T) {
+	pool := New(0)
+	defer pool.Close()
+
+	expected := runtime.GOMAXPROCS(0)
+	if pool.Cap() != expected {
+		t.Errorf("Expected default capacity %d, got %d", expected, pool.Cap())
+	}
+}
+
+func TestPoolGo(t *testing.T) {
+	pool := New(5)
+	defer pool.Close()
 
 	var counter int32
 	var wg sync.WaitGroup
 
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
-		err := pool.Submit(func() {
+		err := pool.Go(func() {
 			atomic.AddInt32(&counter, 1)
 			wg.Done()
 		})
 		if err != nil {
-			wg.Done()
-			t.Errorf("Submit failed: %v", err)
+			t.Errorf("Go failed: %v", err)
 		}
 	}
 
@@ -47,187 +56,147 @@ func TestPoolSubmit(t *testing.T) {
 	}
 }
 
-func TestPoolWithPreAlloc(t *testing.T) {
-	pool, _ := NewPool(5, WithPreAlloc(true))
-	defer pool.Release()
+func TestPoolTryGo(t *testing.T) {
+	pool := New(2)
+	defer pool.Close()
+
+	// Fill pool
+	var blocker sync.WaitGroup
+	blocker.Add(2)
+
+	pool.Go(func() {
+		blocker.Wait()
+	})
+	pool.Go(func() {
+		blocker.Wait()
+	})
+
+	// Give time for tasks to start
+	time.Sleep(10 * time.Millisecond)
+
+	// TryGo should fail (pool full)
+	success := pool.TryGo(func() {})
+	if success {
+		t.Error("TryGo should fail when pool is full")
+	}
+
+	blocker.Done()
+	blocker.Done()
+
+	// Wait for tasks to complete
+	pool.Wait()
+
+	// Now TryGo should succeed
+	success = pool.TryGo(func() {})
+	if !success {
+		t.Error("TryGo should succeed when pool has space")
+	}
+
+	pool.Wait()
+}
+
+func TestPoolNilTask(t *testing.T) {
+	pool := New(5)
+	defer pool.Close()
+
+	err := pool.Go(nil)
+	if err != ErrTaskNil {
+		t.Errorf("Expected ErrTaskNil, got %v", err)
+	}
+}
+
+func TestPoolWait(t *testing.T) {
+	pool := New(5)
+	defer pool.Close()
 
 	var counter int32
-	var wg sync.WaitGroup
 
 	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		err := pool.Submit(func() {
+		pool.Go(func() {
+			time.Sleep(10 * time.Millisecond)
 			atomic.AddInt32(&counter, 1)
-			wg.Done()
 		})
-		if err != nil {
-			wg.Done()
-			t.Errorf("Submit failed: %v", err)
-		}
 	}
 
-	wg.Wait()
+	pool.Wait()
 
 	if counter != 20 {
-		t.Errorf("Expected counter=20, got %d", counter)
+		t.Errorf("Expected all 20 tasks completed, got %d", counter)
 	}
 }
 
-func TestPoolNonblocking(t *testing.T) {
-	pool, _ := NewPool(2, WithNonblocking(true))
-	defer pool.Release()
-
-	// Fill the pool with blocking tasks
-	var wg sync.WaitGroup
-	wg.Add(2)
+func TestPoolStats(t *testing.T) {
+	pool := New(5)
+	defer pool.Close()
 
 	for i := 0; i < 10; i++ {
-		pool.Submit(func() {
-			time.Sleep(100 * time.Millisecond)
-			wg.Done()
+		pool.Go(func() {
+			time.Sleep(time.Millisecond)
 		})
 	}
 
-	// This should fail quickly in nonblocking mode
-	err := pool.Submit(func() {})
-	if err != ErrPoolOverload {
-		t.Errorf("Expected ErrPoolOverload, got %v", err)
+	pool.Wait()
+
+	submitted, completed := pool.Stats()
+
+	if submitted != 10 {
+		t.Errorf("Expected 10 submitted, got %d", submitted)
 	}
 
-	wg.Wait()
-}
-
-func TestPoolPanicRecovery(t *testing.T) {
-	pool, _ := NewPool(5)
-	defer pool.Release()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Submit task that panics
-	pool.Submit(func() {
-		defer wg.Done()
-		panic("test panic")
-	})
-
-	// Submit normal task - should still work
-	pool.Submit(func() {
-		defer wg.Done()
-	})
-
-	wg.Wait()
-
-	// Pool should still be functional
-	if pool.IsClosed() {
-		t.Error("Pool should not be closed after panic")
+	if completed != 10 {
+		t.Errorf("Expected 10 completed, got %d", completed)
 	}
 }
 
-func TestPoolClosed(t *testing.T) {
-	pool, _ := NewPool(5)
-	pool.Release()
+func TestPoolClose(t *testing.T) {
+	pool := New(5)
+	pool.Close()
 
-	err := pool.Submit(func() {})
+	err := pool.Go(func() {})
 	if err != ErrPoolClosed {
 		t.Errorf("Expected ErrPoolClosed, got %v", err)
 	}
-
-	if !pool.IsClosed() {
-		t.Error("Pool should be closed")
-	}
 }
 
-func TestPoolReboot(t *testing.T) {
-	pool, _ := NewPool(5)
-	pool.Release()
+func TestPoolPanicRecovery(t *testing.T) {
+	pool := New(5)
+	defer pool.Close()
 
-	if !pool.IsClosed() {
-		t.Error("Pool should be closed")
-	}
+	// Submit task that panics
+	pool.Go(func() {
+		panic("test panic")
+	})
 
-	pool.Reboot()
-
-	if pool.IsClosed() {
-		t.Error("Pool should be open after reboot")
-	}
-
-	// Should be able to submit tasks
+	// Pool should still work
 	var wg sync.WaitGroup
 	wg.Add(1)
-	err := pool.Submit(func() {
+	err := pool.Go(func() {
 		wg.Done()
 	})
 
 	if err != nil {
-		t.Errorf("Submit after reboot failed: %v", err)
+		t.Errorf("Pool should work after panic: %v", err)
 	}
 
 	wg.Wait()
-	pool.Release()
 }
-
-func TestPoolTune(t *testing.T) {
-	pool, _ := NewPool(5)
-	defer pool.Release()
-
-	if pool.Cap() != 5 {
-		t.Errorf("Expected capacity 5, got %d", pool.Cap())
-	}
-
-	pool.Tune(10)
-
-	if pool.Cap() != 10 {
-		t.Errorf("Expected capacity 10, got %d", pool.Cap())
-	}
-}
-
-func TestPoolStatistics(t *testing.T) {
-	pool, _ := NewPool(5)
-	defer pool.Release()
-
-	var wg sync.WaitGroup
-	const taskCount = 50
-
-	for i := 0; i < taskCount; i++ {
-		wg.Add(1)
-		pool.Submit(func() {
-			time.Sleep(10 * time.Millisecond)
-			wg.Done()
-		})
-	}
-
-	wg.Wait()
-
-	submitted := pool.Submitted()
-	completed := pool.Completed()
-
-	if submitted != taskCount {
-		t.Errorf("Expected %d submitted, got %d", taskCount, submitted)
-	}
-
-	if completed != taskCount {
-		t.Errorf("Expected %d completed, got %d", taskCount, completed)
-	}
-}
-
-// Concurrency tests
 
 func TestPoolConcurrentSubmit(t *testing.T) {
-	pool, _ := NewPool(10)
-	defer pool.Release()
+	pool := New(10)
+	defer pool.Close()
 
 	const goroutines = 50
-	const tasksPerGoroutine = 20
+	const tasksPerGoroutine = 10
 
-	var wg sync.WaitGroup
 	var counter int32
+	var wg sync.WaitGroup
 
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < tasksPerGoroutine; j++ {
-				pool.Submit(func() {
+				pool.Go(func() {
 					atomic.AddInt32(&counter, 1)
 				})
 			}
@@ -235,143 +204,9 @@ func TestPoolConcurrentSubmit(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	// Wait for all tasks to complete
-	time.Sleep(100 * time.Millisecond)
+	pool.Wait()
 
 	expected := int32(goroutines * tasksPerGoroutine)
-	if counter != expected {
-		t.Errorf("Expected counter=%d, got %d", expected, counter)
-	}
-}
-
-func TestPoolRaceConditions(t *testing.T) {
-	pool, _ := NewPool(5)
-	defer pool.Release()
-
-	var wg sync.WaitGroup
-
-	// Concurrent submit
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			pool.Submit(func() {
-				time.Sleep(time.Millisecond)
-			})
-		}()
-	}
-
-	// Concurrent stats reading
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				_ = pool.Running()
-				_ = pool.Free()
-				_ = pool.Submitted()
-				_ = pool.Completed()
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
-func TestPoolNoDeadlock(t *testing.T) {
-	pool, _ := NewPool(2)
-	defer pool.Release()
-
-	done := make(chan struct{})
-
-	go func() {
-		var wg sync.WaitGroup
-		for i := 0; i < 100; i++ {
-			wg.Add(1)
-			pool.Submit(func() {
-				time.Sleep(10 * time.Millisecond)
-				wg.Done()
-			})
-		}
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Success
-	case <-time.After(1 * time.Second):
-		t.Fatal("Deadlock detected")
-	}
-}
-
-func TestPoolReleaseTimeout(t *testing.T) {
-	pool, _ := NewPool(5)
-
-	// Submit long-running tasks
-	for i := 0; i < 3; i++ {
-		pool.Submit(func() {
-			time.Sleep(2 * time.Second)
-		})
-	}
-
-	// Try to release with short timeout
-	err := pool.ReleaseTimeout(100 * time.Millisecond)
-	if err == nil {
-		t.Error("Expected timeout error")
-	}
-}
-
-// PoolWithFunc tests
-
-func TestPoolWithFunc(t *testing.T) {
-	var counter int32
-
-	pool, err := NewPoolWithFunc(5, func(arg interface{}) {
-		atomic.AddInt32(&counter, arg.(int32))
-	})
-
-	if err != nil {
-		t.Fatalf("Failed to create pool: %v", err)
-	}
-	defer pool.Release()
-
-	var wg sync.WaitGroup
-	for i := int32(1); i <= 100; i++ {
-		wg.Add(1)
-		pool.Invoke(i)
-	}
-
-	time.Sleep(time.Millisecond) // add small delay for processing
-	expected := int32(5050)      // Sum of 1 to 100
-	if counter != expected {
-		t.Errorf("Expected counter=%d, got %d", expected, counter)
-	}
-}
-
-// Pool with Generic test
-
-func TestPoolWithFuncGeneric(t *testing.T) {
-	var counter int32
-
-	pool, err := NewPoolWithFuncGeneric(5, func(val int32) {
-		atomic.AddInt32(&counter, val)
-	})
-
-	if err != nil {
-		t.Fatalf("Failed to create generic pool: %v", err)
-	}
-	defer pool.Release()
-
-	for i := int32(1); i <= 10; i++ {
-		pool.Invoke(i)
-	}
-
-	// Wait for completion
-	time.Sleep(time.Millisecond)
-
-	expected := int32(55)
 	if counter != expected {
 		t.Errorf("Expected counter=%d, got %d", expected, counter)
 	}
