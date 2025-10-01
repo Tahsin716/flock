@@ -201,82 +201,136 @@ func BenchmarkRealisticCPUWork(b *testing.B) {
 		pool, _ := NewPool(runtime.GOMAXPROCS(0), WithPreAlloc(true))
 		defer pool.Release()
 
-		var wg sync.WaitGroup
-		wg.Add(b.N)
-
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
+			var wg sync.WaitGroup
+			wg.Add(1)
 			pool.Submit(func() {
 				// Simulate CPU work: 1000 iterations
 				sum := 0
 				for j := 0; j < 1000; j++ {
 					sum += j * j
 				}
-				_ = sum
+				runtime.KeepAlive(sum) // Prevent optimization
 				wg.Done()
 			})
+			wg.Wait() // Wait for THIS task to complete
 		}
-		wg.Wait()
 	})
 
 	b.Run("Goroutines", func(b *testing.B) {
-		var wg sync.WaitGroup
-		wg.Add(b.N)
-
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
+			var wg sync.WaitGroup
+			wg.Add(1)
 			go func() {
 				sum := 0
 				for j := 0; j < 1000; j++ {
 					sum += j * j
 				}
-				_ = sum
+				runtime.KeepAlive(sum)
 				wg.Done()
 			}()
+			wg.Wait()
 		}
-		wg.Wait()
+	})
+
+	b.Run("DirectCall", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			sum := 0
+			for j := 0; j < 1000; j++ {
+				sum += j * j
+			}
+			runtime.KeepAlive(sum)
+		}
+	})
+}
+
+func BenchmarkBatchCPUWork(b *testing.B) {
+	const batchSize = 100
+
+	b.Run("Pool", func(b *testing.B) {
+		pool, _ := NewPool(runtime.GOMAXPROCS(0), WithPreAlloc(true))
+		defer pool.Release()
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var wg sync.WaitGroup
+			wg.Add(batchSize)
+
+			for j := 0; j < batchSize; j++ {
+				pool.Submit(func() {
+					sum := 0
+					for k := 0; k < 1000; k++ {
+						sum += k * k
+					}
+					runtime.KeepAlive(sum)
+					wg.Done()
+				})
+			}
+			wg.Wait()
+		}
+	})
+
+	b.Run("Goroutines", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var wg sync.WaitGroup
+			wg.Add(batchSize)
+
+			for j := 0; j < batchSize; j++ {
+				go func() {
+					sum := 0
+					for k := 0; k < 1000; k++ {
+						sum += k * k
+					}
+					runtime.KeepAlive(sum)
+					wg.Done()
+				}()
+			}
+			wg.Wait()
+		}
 	})
 }
 
 func BenchmarkRealisticIOWork(b *testing.B) {
 	b.Run("Pool", func(b *testing.B) {
-		pool, _ := NewPool(runtime.GOMAXPROCS(0)*2, WithPreAlloc(true))
+		pool, _ := NewPool(runtime.GOMAXPROCS(0)*4, WithPreAlloc(true))
 		defer pool.Release()
-
-		var wg sync.WaitGroup
-		wg.Add(b.N)
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
+			var wg sync.WaitGroup
+			wg.Add(1)
 			pool.Submit(func() {
-				// Simulate I/O wait
-				time.Sleep(100 * time.Microsecond)
+				// Simulate blocking I/O
+				time.Sleep(10 * time.Microsecond)
 				wg.Done()
 			})
+			wg.Wait()
 		}
-		wg.Wait()
 	})
 
 	b.Run("Goroutines", func(b *testing.B) {
-		var wg sync.WaitGroup
-		wg.Add(b.N)
-
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
+			var wg sync.WaitGroup
+			wg.Add(1)
 			go func() {
-				time.Sleep(100 * time.Microsecond)
+				time.Sleep(10 * time.Microsecond)
 				wg.Done()
 			}()
+			wg.Wait()
 		}
-		wg.Wait()
 	})
 }
 
 func BenchmarkHighVolume(b *testing.B) {
-	const taskCount = 10000
+	const taskCount = 1000
 
-	b.Run("Pool", func(b *testing.B) {
-		pool, _ := NewPool(100, WithPreAlloc(true))
+	b.Run("Pool-1000tasks", func(b *testing.B) {
+		pool, _ := NewPool(50, WithPreAlloc(true))
 		defer pool.Release()
 
 		b.ResetTimer()
@@ -291,7 +345,7 @@ func BenchmarkHighVolume(b *testing.B) {
 					for k := 0; k < 100; k++ {
 						sum += k
 					}
-					_ = sum
+					runtime.KeepAlive(sum)
 					wg.Done()
 				})
 			}
@@ -299,7 +353,7 @@ func BenchmarkHighVolume(b *testing.B) {
 		}
 	})
 
-	b.Run("Goroutines", func(b *testing.B) {
+	b.Run("Goroutines-1000tasks", func(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			var wg sync.WaitGroup
@@ -311,11 +365,43 @@ func BenchmarkHighVolume(b *testing.B) {
 					for k := 0; k < 100; k++ {
 						sum += k
 					}
-					_ = sum
+					runtime.KeepAlive(sum)
 					wg.Done()
 				}()
 			}
 			wg.Wait()
 		}
+	})
+}
+
+// Throughput benchmark - how many tasks per second
+func BenchmarkThroughput(b *testing.B) {
+	b.Run("Pool", func(b *testing.B) {
+		pool, _ := NewPool(runtime.GOMAXPROCS(0), WithPreAlloc(true))
+		defer pool.Release()
+
+		var completed int64
+		done := make(chan struct{})
+
+		// Producer
+		go func() {
+			for i := 0; i < b.N; i++ {
+				pool.Submit(func() {
+					atomic.AddInt64(&completed, 1)
+				})
+			}
+			close(done)
+		}()
+
+		b.ResetTimer()
+		<-done
+		b.StopTimer()
+
+		// Wait for completion
+		for atomic.LoadInt64(&completed) < int64(b.N) {
+			time.Sleep(time.Millisecond)
+		}
+
+		b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
 	})
 }
