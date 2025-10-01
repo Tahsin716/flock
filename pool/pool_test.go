@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -209,5 +210,44 @@ func TestPoolConcurrentSubmit(t *testing.T) {
 	expected := int32(goroutines * tasksPerGoroutine)
 	if counter != expected {
 		t.Errorf("Expected counter=%d, got %d", expected, counter)
+	}
+}
+
+// ============================================================================
+// ErrorPool Tests
+// ============================================================================
+
+func TestErrorPool(t *testing.T) {
+	pool := NewErrorPool(5)
+	defer pool.Close()
+
+	testErr := errors.New("test error")
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Success task
+	pool.GoE(func() error {
+		wg.Done()
+		return nil
+	})
+
+	// Error task
+	pool.GoE(func() error {
+		wg.Done()
+		return testErr
+	})
+
+	// Another error
+	pool.GoE(func() error {
+		wg.Done()
+		return errors.New("another error")
+	})
+
+	wg.Wait()
+
+	errs := pool.Errors()
+	if len(errs) != 2 {
+		t.Errorf("Expected 2 errors, got %d", len(errs))
 	}
 }
