@@ -1,6 +1,11 @@
 package flock
 
-import "testing"
+import (
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+)
 
 // ============================================================================
 // BASIC FUNCTIONALITY TESTS
@@ -132,5 +137,122 @@ func TestLockFreeQueue_WrapAround(t *testing.T) {
 		if count != 1 {
 			t.Errorf("Task not executed correctly at iteration %d", i)
 		}
+	}
+}
+
+// ============================================================================
+// CONCURRENT TESTS
+// ============================================================================
+
+func TestLockFreeQueue_ConcurrentPushPop(t *testing.T) {
+	q := New(1024)
+	numProducers := 4
+	itemsPerProducer := 10000
+
+	var pushed, popped int64
+	var wg sync.WaitGroup
+
+	// Start producers
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < itemsPerProducer; j++ {
+				// Keep trying until successful
+				for !q.TryPush(func() {}) {
+					runtime.Gosched()
+				}
+				atomic.AddInt64(&pushed, 1)
+			}
+		}(i)
+	}
+
+	// Start consumer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		expected := int64(numProducers * itemsPerProducer)
+		for atomic.LoadInt64(&popped) < expected {
+			if task := q.Pop(); task != nil {
+				atomic.AddInt64(&popped, 1)
+				task()
+			} else {
+				runtime.Gosched()
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	if pushed != popped {
+		t.Errorf("Lost tasks: pushed %d, popped %d", pushed, popped)
+	}
+
+	if !q.IsEmpty() {
+		t.Errorf("Queue not empty after test, size: %d", q.Size())
+	}
+}
+
+func TestLockFreeQueue_HighContention(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping high contention test in short mode")
+	}
+
+	q := New(2048)
+	numProducers := runtime.NumCPU()
+	itemsPerProducer := 50000
+
+	var pushed, popped int64
+	var wg sync.WaitGroup
+	var producersDone int32
+
+	// Many producers
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < itemsPerProducer; j++ {
+				for !q.TryPush(func() {}) {
+					runtime.Gosched()
+				}
+				atomic.AddInt64(&pushed, 1)
+			}
+		}()
+	}
+
+	// Signal when all producers are done
+	go func() {
+		wg.Wait()
+		atomic.StoreInt32(&producersDone, 1)
+	}()
+
+	// Single consumer
+	expected := int64(numProducers * itemsPerProducer)
+	for {
+		if task := q.Pop(); task != nil {
+			atomic.AddInt64(&popped, 1)
+			// Check if we've processed all items
+			if atomic.LoadInt64(&popped) >= expected {
+				break
+			}
+		} else {
+			// Queue is empty - check if producers are done
+			if atomic.LoadInt32(&producersDone) == 1 {
+				// Producers done, but double-check queue is empty
+				if q.Pop() == nil {
+					break
+				}
+			} else {
+				// Producers still working, yield and retry
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Wait for all producers to finish
+	wg.Wait()
+
+	if pushed != popped {
+		t.Errorf("Lost tasks under high contention: pushed %d, popped %d", pushed, popped)
 	}
 }
