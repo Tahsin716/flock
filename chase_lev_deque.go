@@ -35,6 +35,8 @@ type ChaseLevDeque struct {
 	// Can be replaced with a larger one when full
 	// atomic.Value allows lock-free replacement
 	array atomic.Value // stores *circularArray
+
+	minCapacity int64 // Never shrink the queue size below this capacity
 }
 
 // circularArray is the underlying storage for the deque
@@ -51,8 +53,9 @@ func NewChaseLevDeque(initialCapacity int64) *ChaseLevDeque {
 	}
 
 	d := &ChaseLevDeque{
-		top:    0,
-		bottom: 0,
+		top:         0,
+		bottom:      0,
+		minCapacity: initialCapacity,
 	}
 
 	// Initialize with the initial array
@@ -306,10 +309,15 @@ func (d *ChaseLevDeque) Capacity() int64 {
 	return array.capacity
 }
 
+// MinCapacity returns the minimum capacity
+func (d *ChaseLevDeque) MinCapacity() int64 {
+	return d.minCapacity
+}
+
 // Reset clears the deque
 // NOT thread-safe - only call when no concurrent operations
 func (d *ChaseLevDeque) Reset() {
 	atomic.StoreInt64(&d.top, 0)
 	atomic.StoreInt64(&d.bottom, 0)
-	d.array.Store(newCircularArray(16))
+	d.array.Store(newCircularArray(d.minCapacity))
 }
