@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ============================================================================
@@ -255,4 +256,71 @@ func TestLockFreeQueue_HighContention(t *testing.T) {
 	if pushed != popped {
 		t.Errorf("Lost tasks under high contention: pushed %d, popped %d", pushed, popped)
 	}
+}
+
+// ============================================================================
+// STRESS TESTS
+// ============================================================================
+
+func TestLockFreeQueue_StressTest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
+
+	q := New(2048)
+	duration := 3 * time.Second
+
+	var pushed, popped int64
+	stop := make(chan struct{})
+
+	// Producers
+	numProducers := 4
+	for i := 0; i < numProducers; i++ {
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if q.TryPush(func() {}) {
+						atomic.AddInt64(&pushed, 1)
+					}
+				}
+			}
+		}()
+	}
+
+	// Consumer
+	go func() {
+		for {
+			select {
+			case <-stop:
+				// Drain remaining
+				for q.Pop() != nil {
+					atomic.AddInt64(&popped, 1)
+				}
+				return
+			default:
+				if task := q.Pop(); task != nil {
+					atomic.AddInt64(&popped, 1)
+				}
+			}
+		}
+	}()
+
+	// Run for duration
+	time.Sleep(duration)
+	close(stop)
+
+	// Give time to drain
+	time.Sleep(100 * time.Millisecond)
+
+	finalPushed := atomic.LoadInt64(&pushed)
+	finalPopped := atomic.LoadInt64(&popped)
+
+	if finalPushed != finalPopped {
+		t.Errorf("Stress test failed: pushed %d, popped %d", finalPushed, finalPopped)
+	}
+
+	t.Logf("Stress test completed: %d tasks processed in %v", finalPopped, duration)
 }
