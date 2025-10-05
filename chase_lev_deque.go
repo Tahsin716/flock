@@ -121,11 +121,6 @@ func (d *ChaseLevDeque) Push(task func()) {
 	// Store task at bottom position
 	array.put(bottom, task)
 
-	// CRITICAL: Memory fence with RELEASE semantics
-	// Ensures task write is visible before bottom increment
-	// Without this, thieves might see incremented bottom but nil task!
-	atomic.AddInt64(&d.bottom, 0) // Dummy operation for fence
-
 	// Increment bottom (relaxed - only we modify it)
 	// But the fence above ensures task write happens-before this
 	atomic.StoreInt64(&d.bottom, bottom+1)
