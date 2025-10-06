@@ -1,21 +1,7 @@
 package flock
 
-import "time"
-
-// OverflowStrategy defines how to handle task submission when queues are full
-type OverflowStrategy int
-
-const (
-	// Block will block the submitter until space is available
-	Block OverflowStrategy = iota
-	// DropOldest will drop the oldest task in the queue
-	DropOldest
-	// DropNewest will drop the incoming task
-	DropNewest
-	// ReturnError will return an error to the caller
-	ReturnError
-	// ExecuteCaller will execute the task in the caller's goroutine
-	ExecuteCaller
+import (
+	"time"
 )
 
 // Config contains all configuration options for the worker pool
@@ -24,16 +10,13 @@ type Config struct {
 	// If 0, defaults to runtime.NumCPU()
 	NumWorkers int
 
-	// QueueSizePerWorker is the size of each worker's local queue
-	// Must be a power of 2. If 0, defaults to 1024
+	// QueueSizePerWorker is the initial size of each worker's deque (Must be a power of 2)
+	// The deque grows dynamically up to maxDequeCapacity (65536)
+	// If 0, defaults to 256
 	QueueSizePerWorker int
 
-	// OverflowStrategy determines behavior when queues are full
-	// Defaults to Block
-	OverflowStrategy OverflowStrategy
-
 	// PanicHandler is called when a task panics
-	// If nil, panics are logged to stderr
+	// If nil, panics are silently caught (stack trace captured internally)
 	PanicHandler func(interface{})
 
 	// OnWorkerStart is called when a worker starts
@@ -44,30 +27,33 @@ type Config struct {
 	// Useful for cleanup, logging, or tracing
 	OnWorkerStop func(workerID int)
 
-	// PinWorkerThreads attempts to pin workers to CPU cores
-	// This can improve cache locality but may reduce flexibility
-	// Platform-specific, may have no effect on some systems
+	// PinWorkerThreads attempts to pin workers to OS threads
+	// Can improve cache locality but reduces scheduling flexibility
+	// Default: false (let Go scheduler manage)
 	PinWorkerThreads bool
 
 	// MaxParkTime is the maximum time a worker will sleep when idle
-	// Defaults to 10ms
+	// Lower values: better latency, higher CPU usage when idle
+	// Higher values: worse latency, lower CPU usage when idle
+	// Default: 10ms (good balance)
 	MaxParkTime time.Duration
 
 	// SpinCount is the number of iterations to spin before parking
-	// Higher values reduce latency but increase CPU usage when idle
-	// Defaults to 30
+	// Higher values: better latency for bursty workloads, higher CPU usage
+	// Lower values: worse latency, lower CPU usage
+	// Default: 30 iterations (~1-10µs on modern CPUs)
 	SpinCount int
 }
 
-// DefaultConfig returns a Config with sensible defaults
+// DefaultConfig returns a Config with production-ready defaults
 func DefaultConfig() Config {
 	return Config{
-		NumWorkers:         0, // will be set to runtime.NumCPU()
-		QueueSizePerWorker: 1024,
-		OverflowStrategy:   Block,
+		NumWorkers:         0, // runtime.NumCPU()
+		QueueSizePerWorker: 256,
 		PanicHandler:       nil,
 		MaxParkTime:        10 * time.Millisecond,
 		SpinCount:          30,
+		PinWorkerThreads:   false,
 	}
 }
 
@@ -77,40 +63,37 @@ func (c *Config) Validate() error {
 		return ErrInvalidConfig("NumWorkers must be >= 0")
 	}
 
-	if c.QueueSizePerWorker < 0 {
-		return ErrInvalidConfig("QueueSizePerWorker must be >= 0")
+	if c.NumWorkers > 10000 {
+		return ErrInvalidConfig("NumWorkers too large (>10000), likely a mistake")
 	}
 
-	if c.QueueSizePerWorker > 0 && !isPowerOfTwo(c.QueueSizePerWorker) {
+	if c.QueueSizePerWorker <= 0 {
+		return ErrInvalidConfig("QueueSizePerWorker must be positive")
+	}
+
+	if c.QueueSizePerWorker&(c.QueueSizePerWorker-1) != 0 {
 		return ErrInvalidConfig("QueueSizePerWorker must be a power of 2")
 	}
 
-	if c.MaxParkTime < 0 {
-		return ErrInvalidConfig("MaxParkTime must be >= 0")
+	if c.QueueSizePerWorker > 100000 {
+		return ErrInvalidConfig("QueueSizePerWorker too large (>100000), use dynamic sizing")
+	}
+
+	if c.MaxParkTime <= 0 {
+		return ErrInvalidConfig("MaxParkTime must be positive")
+	}
+
+	if c.MaxParkTime > 1*time.Minute {
+		return ErrInvalidConfig("MaxParkTime too large (>1min), workers may appear stuck")
 	}
 
 	if c.SpinCount < 0 {
 		return ErrInvalidConfig("SpinCount must be >= 0")
 	}
 
-	return nil
-}
-
-func isPowerOfTwo(n int) bool {
-	return n > 0 && (n&(n-1)) == 0
-}
-
-func nextPowerOfTwo(n int) int {
-	if n <= 0 {
-		return 1
+	if c.SpinCount > 10000 {
+		return ErrInvalidConfig("SpinCount too large (>10000), will waste CPU")
 	}
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	n |= n >> 32
-	n++
-	return n
+
+	return nil
 }
