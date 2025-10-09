@@ -86,21 +86,21 @@ func NewPool(opts ...Option) (*Pool, error) {
 }
 
 // Submit never fails - executes in caller's goroutine if queues full
-func (p *Pool) Submit(task func()) {
+func (p *Pool) Submit(task func()) error {
 	if task == nil {
-		return
+		return ErrNilTask
 	}
 
 	state := p.state.Load().(PoolState)
 	if state == PoolStateStopped {
-		return
+		return ErrPoolShutdown
 	}
 
 	atomic.AddUint64(&p.metrics.submitted, 1)
 	p.submitWg.Add(1)
 
 	if p.tryFastSubmit(task) {
-		return
+		return nil
 	}
 
 	// Fallback: execute in caller's goroutine
@@ -109,6 +109,8 @@ func (p *Pool) Submit(task func()) {
 	p.execute(task)
 	p.recordLatency(time.Since(startTime))
 	atomic.AddUint64(&p.metrics.completed, 1)
+
+	return nil
 }
 
 // TrySubmit returns error if queues full
