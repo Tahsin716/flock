@@ -97,3 +97,48 @@ func (c *Config) Validate() error {
 
 	return nil
 }
+
+//
+// ---- Option Pattern ----
+//
+
+// Option is a function that modifies a Config
+type Option func(*Config)
+
+// WithNumWorkers sets the number of workers.
+func WithNumWorkers(n int) Option {
+	return func(c *Config) { c.NumWorkers = n }
+}
+
+// WithQueueSizePerWorker sets queue size per worker.
+func WithQueueSizePerWorker(size int) Option {
+	return func(c *Config) { c.QueueSizePerWorker = size }
+}
+
+// WithPanicHandler sets a panic handler function.
+func WithPanicHandler(handler func(interface{})) Option {
+	return func(c *Config) { c.PanicHandler = handler }
+}
+
+// WithWorkerHooks sets worker lifecycle hooks.
+func WithWorkerHooks(onStart, onStop func(int)) Option {
+	return func(c *Config) {
+		c.OnWorkerStart = onStart
+		c.OnWorkerStop = onStop
+	}
+}
+
+// WithPinWorkerThreads controls thread pinning.
+func WithPinWorkerThreads(enabled bool) Option {
+	return func(c *Config) { c.PinWorkerThreads = enabled }
+}
+
+// WithMaxParkTime sets the max park duration for idle workers.
+func WithMaxParkTime(d time.Duration) Option {
+	return func(c *Config) { c.MaxParkTime = d }
+}
+
+// WithSpinCount sets how many spins before parking.
+func WithSpinCount(n int) Option {
+	return func(c *Config) { c.SpinCount = n }
+}

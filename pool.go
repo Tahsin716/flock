@@ -49,44 +49,37 @@ type poolMetrics struct {
 }
 
 // NewPool creates a new worker pool
-func NewPool(config Config) (*Pool, error) {
-	if err := config.Validate(); err != nil {
+func NewPool(opts ...Option) (*Pool, error) {
+	// Start with default config
+	cfg := DefaultConfig()
+
+	// Apply user options
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	// Validate final configuration
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
-	// Apply defaults
-	if config.NumWorkers == 0 {
-		config.NumWorkers = runtime.NumCPU()
-	}
-	if config.QueueSizePerWorker == 0 {
-		config.QueueSizePerWorker = 256
-	}
-	if config.MaxParkTime == 0 {
-		config.MaxParkTime = DefaultConfig().MaxParkTime
-	}
-	if config.SpinCount == 0 {
-		config.SpinCount = DefaultConfig().SpinCount
-	}
-
 	pool := &Pool{
-		config:  config,
-		workers: make([]*Worker, config.NumWorkers),
+		config:  cfg,
+		workers: make([]*Worker, cfg.NumWorkers),
 	}
 	pool.state.Store(PoolStateRunning)
 
-	// Initialize workers
-	for i := 0; i < config.NumWorkers; i++ {
-		pool.workers[i] = newWorker(i, pool, int(config.QueueSizePerWorker))
+	// Initialize and start workers
+	for i := 0; i < cfg.NumWorkers; i++ {
+		pool.workers[i] = newWorker(i, pool, cfg.QueueSizePerWorker)
 	}
 
-	// Start workers
-	for i := 0; i < config.NumWorkers; i++ {
+	for _, w := range pool.workers {
 		pool.wg.Add(1)
-		worker := pool.workers[i]
-		go func() {
+		go func(worker *Worker) {
 			defer pool.wg.Done()
 			worker.run()
-		}()
+		}(w)
 	}
 
 	return pool, nil
