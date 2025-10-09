@@ -24,8 +24,9 @@ type Pool struct {
 	workers []*Worker
 
 	// Lifecycle management
-	state atomic.Value // PoolState
-	wg    sync.WaitGroup
+	state    atomic.Value // PoolState
+	wg       sync.WaitGroup
+	submitWg sync.WaitGroup
 
 	// worker id for round-robin distribution of tasks
 	nextWorkerId uint64
@@ -44,11 +45,10 @@ type poolMetrics struct {
 	submitted uint64 // atomic
 	completed uint64 // atomic
 	rejected  uint64 // atomic
-	stolen    uint64 // atomic
 	fallback  uint64 // atomic
 }
 
-// New creates a new worker pool
+// NewPool creates a new worker pool
 func NewPool(config Config) (*Pool, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -76,9 +76,7 @@ func NewPool(config Config) (*Pool, error) {
 
 	// Initialize workers
 	for i := 0; i < config.NumWorkers; i++ {
-		// Ensure external queue size is power of 2
-		extSize := config.QueueSizePerWorker
-		pool.workers[i] = newWorker(i, pool, extSize, int64(config.QueueSizePerWorker))
+		pool.workers[i] = newWorker(i, pool, int(config.QueueSizePerWorker))
 	}
 
 	// Start workers
@@ -106,12 +104,14 @@ func (p *Pool) Submit(task func()) {
 	}
 
 	atomic.AddUint64(&p.metrics.submitted, 1)
+	p.submitWg.Add(1)
 
 	if p.tryFastSubmit(task) {
 		return
 	}
 
 	// Fallback: execute in caller's goroutine
+	defer p.submitWg.Done()
 	atomic.AddUint64(&p.metrics.fallback, 1)
 	startTime := time.Now()
 	task()
@@ -152,7 +152,7 @@ func (p *Pool) tryFastSubmit(task func()) bool {
 		idx := (startIdx + i) % numWorkers
 		worker := p.workers[idx]
 
-		if worker.externalTasks.TryPush(task) {
+		if worker.queue.TryPush(task) {
 			worker.signal()
 			return true
 		}
@@ -206,21 +206,7 @@ func (p *Pool) TrySubmitWithContext(ctx context.Context, task func()) error {
 	return p.TrySubmit(wrapper)
 }
 
-// SubmitWithTimeout submits with timeout
-func (p *Pool) SubmitWithTimeout(timeout time.Duration, task func()) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	p.SubmitWithContext(ctx, task)
-}
-
-// TrySubmitWithTimeout is TrySubmit with timeout
-func (p *Pool) TrySubmitWithTimeout(timeout time.Duration, task func()) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return p.TrySubmitWithContext(ctx, task)
-}
-
-// Shutdown stops the pool
+// Shutdown stops the pool, and waits for all pending tasks in queue to complete
 func (p *Pool) Shutdown(graceful bool) {
 	if graceful {
 		if !p.state.CompareAndSwap(PoolStateRunning, PoolStateDraining) {
@@ -242,77 +228,10 @@ func (p *Pool) Shutdown(graceful bool) {
 	p.state.Store(PoolStateStopped)
 }
 
-// ShutdownWithTimeout shuts down with timeout
-func (p *Pool) ShutdownWithTimeout(timeout time.Duration, graceful bool) error {
-	if graceful {
-		if !p.state.CompareAndSwap(PoolStateRunning, PoolStateDraining) {
-			return nil
-		}
-	} else {
-		p.state.Store(PoolStateStopped)
-		for _, worker := range p.workers {
-			worker.signal()
-		}
-	}
-
-	done := make(chan struct{})
-	go func() {
-		p.wg.Wait()
-		p.state.Store(PoolStateStopped)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-time.After(timeout):
-		return ErrTimeout
-	}
-}
-
 // Wait blocks until all tasks complete
+// it does not shutdown the pool
 func (p *Pool) Wait() {
-	backoff := time.Microsecond
-
-	for {
-		submitted := atomic.LoadUint64(&p.metrics.submitted)
-		completed := atomic.LoadUint64(&p.metrics.completed)
-		rejected := atomic.LoadUint64(&p.metrics.rejected)
-
-		if completed+rejected >= submitted {
-			return
-		}
-
-		time.Sleep(backoff)
-		if backoff < 10*time.Millisecond {
-			backoff *= 2
-		}
-	}
-}
-
-// WaitWithTimeout waits with timeout
-func (p *Pool) WaitWithTimeout(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	backoff := time.Microsecond
-
-	for {
-		submitted := atomic.LoadUint64(&p.metrics.submitted)
-		completed := atomic.LoadUint64(&p.metrics.completed)
-		rejected := atomic.LoadUint64(&p.metrics.rejected)
-
-		if completed+rejected >= submitted {
-			return nil
-		}
-
-		if time.Now().After(deadline) {
-			return ErrTimeout
-		}
-
-		time.Sleep(backoff)
-		if backoff < 10*time.Millisecond {
-			backoff *= 2
-		}
-	}
+	p.submitWg.Wait()
 }
 
 // Stats returns pool statistics
@@ -320,7 +239,6 @@ func (p *Pool) Stats() Stats {
 	submitted := atomic.LoadUint64(&p.metrics.submitted)
 	completed := atomic.LoadUint64(&p.metrics.completed)
 	rejected := atomic.LoadUint64(&p.metrics.rejected)
-	stolen := atomic.LoadUint64(&p.metrics.stolen)
 	fallback := atomic.LoadUint64(&p.metrics.fallback)
 	inFlight := submitted - completed - rejected
 
@@ -329,23 +247,18 @@ func (p *Pool) Stats() Stats {
 	totalCapacity := int64(0)
 
 	for i, worker := range p.workers {
-		extDepth := worker.externalTasks.Size()
-		localDepth := int(worker.localWork.Size())
-		extCap := worker.externalTasks.Capacity()
-		localCap := int(worker.localWork.Capacity())
+		depth := worker.queue.Size()
+		capacity := worker.queue.Capacity()
 
-		totalDepth += int64(extDepth + localDepth)
-		totalCapacity += int64(extCap + localCap)
+		totalDepth += int64(depth)
+		totalCapacity += int64(capacity)
 
 		workerStats[i] = WorkerStats{
-			WorkerID:         i,
-			TasksExecuted:    atomic.LoadUint64(&worker.tasksExecuted),
-			TasksStolen:      atomic.LoadUint64(&worker.tasksStolen),
-			ExternalDepth:    extDepth,
-			LocalDepth:       localDepth,
-			ExternalCapacity: extCap,
-			LocalCapacity:    localCap,
-			State:            worker.getState(),
+			WorkerID:      i,
+			TasksExecuted: atomic.LoadUint64(&worker.tasksExecuted),
+			TasksFailed:   atomic.LoadUint64(&worker.tasksFailed),
+			Capacity:      capacity,
+			State:         worker.getState(),
 		}
 	}
 
@@ -368,7 +281,6 @@ func (p *Pool) Stats() Stats {
 		Submitted:          submitted,
 		Completed:          completed,
 		Rejected:           rejected,
-		Stolen:             stolen,
 		FallbackExecuted:   fallback,
 		InFlight:           inFlight,
 		Utilization:        utilization,
@@ -407,14 +319,11 @@ func (p *Pool) GetWorkerStats(workerID int) (WorkerStats, error) {
 
 	worker := p.workers[workerID]
 	return WorkerStats{
-		WorkerID:         workerID,
-		TasksExecuted:    atomic.LoadUint64(&worker.tasksExecuted),
-		TasksStolen:      atomic.LoadUint64(&worker.tasksStolen),
-		ExternalDepth:    worker.externalTasks.Size(),
-		LocalDepth:       int(worker.localWork.Size()),
-		ExternalCapacity: worker.externalTasks.Capacity(),
-		LocalCapacity:    int(worker.localWork.Capacity()),
-		State:            worker.getState(),
+		WorkerID:      workerID,
+		TasksExecuted: atomic.LoadUint64(&worker.tasksExecuted),
+		TasksFailed:   atomic.LoadUint64(&worker.tasksFailed),
+		Capacity:      worker.queue.Capacity(),
+		State:         worker.getState(),
 	}, nil
 }
 
