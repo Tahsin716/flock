@@ -37,6 +37,8 @@ type ChaseLevDeque struct {
 	array atomic.Value // stores *circularArray
 
 	minCapacity int64 // Never shrink the queue size below this capacity
+
+	maxCapacity int64 // Never expand the queue size above this
 }
 
 // circularArray is the underlying storage for the deque
@@ -56,6 +58,7 @@ func NewChaseLevDeque(initialCapacity int64) *ChaseLevDeque {
 		top:         0,
 		bottom:      0,
 		minCapacity: initialCapacity,
+		maxCapacity: 65536, // 64K tasks max
 	}
 
 	// Initialize with the initial array
@@ -96,9 +99,9 @@ func (a *circularArray) put(index int64, task func()) {
 // Memory Ordering:
 // - RELEASE fence ensures task write happens-before bottom increment
 // - This synchronizes with thieves' ACQUIRE load of bottom
-func (d *ChaseLevDeque) Push(task func()) {
+func (d *ChaseLevDeque) Push(task func()) error {
 	if task == nil {
-		return
+		return ErrNilTask
 	}
 
 	// Load current bottom (relaxed - only we modify it)
@@ -117,6 +120,10 @@ func (d *ChaseLevDeque) Push(task func()) {
 	// Leave one slot empty to avoid ambiguity
 	if size >= array.capacity-1 {
 		// Need more space - allocate new array
+		if array.capacity >= d.maxCapacity {
+			// Can't grow anymore, queue is full
+			return ErrQueueFull
+		}
 		array = d.resize(bottom, top, array)
 		d.array.Store(array) // Atomic replacement
 	}
@@ -127,6 +134,7 @@ func (d *ChaseLevDeque) Push(task func()) {
 	// Increment bottom (relaxed - only we modify it)
 	// But the fence above ensures task write happens-before this
 	atomic.StoreInt64(&d.bottom, bottom+1)
+	return nil
 }
 
 // Pop removes and returns a task from the bottom (owner only, LIFO)

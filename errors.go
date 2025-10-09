@@ -12,6 +12,9 @@ var (
 
 	// ErrTimeout is returned when an operation times out
 	ErrTimeout = &PoolError{msg: "operation timed out"}
+
+	// ErrNilTask is returned when an task submitted is nil
+	ErrNilTask = &PoolError{msg: "task is nil"}
 )
 
 // PoolError represents an error from the worker pool
