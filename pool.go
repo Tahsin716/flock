@@ -111,10 +111,9 @@ func (p *Pool) Submit(task func()) {
 	}
 
 	// Fallback: execute in caller's goroutine
-	defer p.submitWg.Done()
 	atomic.AddUint64(&p.metrics.fallback, 1)
 	startTime := time.Now()
-	task()
+	p.execute(task)
 	p.recordLatency(time.Since(startTime))
 	atomic.AddUint64(&p.metrics.completed, 1)
 }
@@ -337,7 +336,22 @@ func (p *Pool) NumWorkers() int {
 	return len(p.workers)
 }
 
-// fastrand returns a pseudorandom uint32
-//
-//go:linkname fastrand runtime.fastrand
-func fastrand() uint32
+func (p *Pool) execute(task func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			if p.config.PanicHandler != nil {
+				p.config.PanicHandler(r)
+			} else {
+				// Default: capture stack trace silently
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				_ = n // Stack trace in buf[:n]
+			}
+		}
+
+		p.submitWg.Done()
+	}()
+
+	// Execute the task
+	task()
+}
