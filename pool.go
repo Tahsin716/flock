@@ -227,7 +227,7 @@ func (p *Pool) Stats() Stats {
 			TasksExecuted: atomic.LoadUint64(&wk.tasksExecuted),
 			TasksFailed:   atomic.LoadUint64(&wk.tasksFailed),
 			Capacity:      capacity,
-			State:         wk.getState(),
+			State:         wk.getState().string(),
 		}
 	}
 

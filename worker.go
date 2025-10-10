@@ -26,7 +26,7 @@ const (
 	runningState
 )
 
-func (s workerState) String() string {
+func (s workerState) string() string {
 	switch s {
 	case StateRunning:
 		return "RUNNING"
