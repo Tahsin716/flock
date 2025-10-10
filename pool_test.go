@@ -195,3 +195,59 @@ func TestPool_Submit_FallbackExecution(t *testing.T) {
 		t.Error("Expected fallback execution")
 	}
 }
+
+// ============================================================================
+// Panic Handling Tests
+// ============================================================================
+
+func TestPool_PanicRecovery_DefaultHandler(t *testing.T) {
+	pool, err := NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	pool.Submit(func() {
+		panic("test panic")
+	})
+
+	pool.Wait()
+
+	// Pool should still be functional
+	var executed atomic.Bool
+	pool.Submit(func() {
+		executed.Store(true)
+	})
+	pool.Wait()
+
+	if !executed.Load() {
+		t.Error("Pool should still work after panic")
+	}
+}
+
+func TestPool_PanicRecovery_CustomHandler(t *testing.T) {
+	var panicValue atomic.Value
+	pool, err := NewPool(
+		WithPanicHandler(func(r interface{}) {
+			panicValue.Store(r)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	pool.Submit(func() {
+		panic("custom panic")
+	})
+
+	pool.Wait()
+
+	recovered := panicValue.Load()
+	if recovered == nil {
+		t.Error("Panic handler was not called")
+	}
+	if str, ok := recovered.(string); !ok || str != "custom panic" {
+		t.Errorf("Expected 'custom panic', got %v", recovered)
+	}
+}
