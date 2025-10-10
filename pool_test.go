@@ -1,7 +1,10 @@
 package flock
 
 import (
+	"errors"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -69,5 +72,126 @@ func TestNewPool_InvalidConfig(t *testing.T) {
 				t.Error("Expected error, got nil")
 			}
 		})
+	}
+}
+
+// ============================================================================
+// Submit Tests
+// ============================================================================
+
+func TestPool_Submit_Success(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(2))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	var executed atomic.Int32
+	err = pool.Submit(func() {
+		executed.Add(1)
+	})
+
+	if err != nil {
+		t.Errorf("Submit() error = %v", err)
+	}
+
+	pool.Wait()
+
+	if executed.Load() != 1 {
+		t.Errorf("Expected 1 execution, got %d", executed.Load())
+	}
+}
+
+func TestPool_Submit_NilTask(t *testing.T) {
+	pool, err := NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	err = pool.Submit(nil)
+	if !errors.Is(err, ErrNilTask) {
+		t.Errorf("Expected ErrNilTask, got %v", err)
+	}
+}
+
+func TestPool_Submit_AfterShutdown(t *testing.T) {
+	pool, err := NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	pool.Shutdown(false)
+
+	err = pool.Submit(func() {})
+	if !errors.Is(err, ErrPoolShutdown) {
+		t.Errorf("Expected ErrPoolShutdown, got %v", err)
+	}
+}
+
+func TestPool_Submit_Concurrent(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(4))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	const numTasks = 1000
+	var completed atomic.Int32
+
+	var wg sync.WaitGroup
+	for i := 0; i < numTasks; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pool.Submit(func() {
+				completed.Add(1)
+				time.Sleep(time.Microsecond)
+			})
+		}()
+	}
+
+	wg.Wait()
+	pool.Wait()
+
+	if completed.Load() != numTasks {
+		t.Errorf("Expected %d completions, got %d", numTasks, completed.Load())
+	}
+}
+
+func TestPool_Submit_FallbackExecution(t *testing.T) {
+	pool, _ := NewPool(
+		WithNumWorkers(1),
+		WithQueueSizePerWorker(2),
+	)
+	defer pool.Shutdown(false)
+
+	// Fill queue with blocking tasks
+	blockChan := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		pool.Submit(func() {
+			<-blockChan
+		})
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Submit NON-BLOCKING task for fallback
+	var executed atomic.Bool
+	pool.Submit(func() {
+		executed.Store(true) // Fast, non-blocking
+	})
+
+	//  Now we can unblock workers
+	close(blockChan)
+	pool.Wait()
+
+	// Verify fallback happened
+	if !executed.Load() {
+		t.Error("Fallback task not executed")
+	}
+
+	stats := pool.Stats()
+	if stats.FallbackExecuted == 0 {
+		t.Error("Expected fallback execution")
 	}
 }

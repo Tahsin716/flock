@@ -41,10 +41,11 @@ type Pool struct {
 
 // poolMetrics tracks pool-wide statistics
 type poolMetrics struct {
-	submitted uint64 // atomic
-	completed uint64 // atomic
-	rejected  uint64 // atomic
-	fallback  uint64 // atomic
+	submitted      uint64 // atomic
+	completed      uint64 // atomic
+	rejected       uint64 // atomic
+	fallback       uint64 // atomic
+	fallbackFailed uint64 // atomic
 }
 
 // NewPool creates a new worker pool with the given options.
@@ -93,7 +94,7 @@ func NewPool(opts ...Option) (*Pool, error) {
 }
 
 // Submit submits a task to the pool. It never returns an error for queue full -
-// instead it executes the task in the caller's goroutine if all worker queues are full.
+// instead it executes the task in new goroutine if all worker queues are full.
 //
 // Returns ErrNilTask if task is nil.
 // Returns ErrPoolShutdown if the pool has been shut down.
@@ -121,12 +122,14 @@ func (p *Pool) Submit(task func()) error {
 		return nil
 	}
 
-	// Fallback: execute in caller's goroutine
-	atomic.AddUint64(&p.metrics.fallback, 1)
-	startTime := time.Now()
-	p.execute(task)
-	p.recordLatency(time.Since(startTime))
-	atomic.AddUint64(&p.metrics.completed, 1)
+	// Fallback: execute in new goroutine
+	go func() {
+		atomic.AddUint64(&p.metrics.fallback, 1)
+		startTime := time.Now()
+		p.execute(task)
+		p.recordLatency(time.Since(startTime))
+		atomic.AddUint64(&p.metrics.completed, 1)
+	}()
 
 	return nil
 }
@@ -304,7 +307,7 @@ func (p *Pool) recordLatency(duration time.Duration) {
 func (p *Pool) execute(task func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			atomic.AddUint64(&p.workers[0].tasksFailed, 1) // Track panic
+			atomic.AddUint64(&p.metrics.fallbackFailed, 1) // Track panic
 			if p.config.PanicHandler != nil {
 				p.config.PanicHandler(r)
 			} else {
@@ -317,6 +320,7 @@ func (p *Pool) execute(task func()) {
 		}
 
 		p.submitWg.Done()
+		atomic.AddUint64(&p.metrics.completed, 1)
 	}()
 
 	// Execute the task
