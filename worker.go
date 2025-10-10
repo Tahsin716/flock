@@ -7,11 +7,11 @@ import (
 	"time"
 )
 
-// WorkerState represents the current state of a worker
-type WorkerState int32
+// workerState represents the current state of a worker
+type workerState int32
 
 const (
-	StateRunning WorkerState = iota
+	StateRunning workerState = iota
 	StateSpinning
 	StateParked
 	StateShutdown
@@ -24,7 +24,7 @@ const (
 	runningState
 )
 
-func (s WorkerState) String() string {
+func (s workerState) String() string {
 	switch s {
 	case StateRunning:
 		return "RUNNING"
@@ -246,6 +246,6 @@ func (w *worker) drainQueue() {
 }
 
 // getState returns the current worker state
-func (w *worker) getState() WorkerState {
-	return w.state.Load().(WorkerState)
+func (w *worker) getState() workerState {
+	return w.state.Load().(workerState)
 }

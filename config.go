@@ -45,8 +45,8 @@ type Config struct {
 	SpinCount int
 }
 
-// DefaultConfig returns a Config with production-ready defaults
-func DefaultConfig() Config {
+// defaultConfig returns a Config with production-ready defaults
+func defaultConfig() Config {
 	return Config{
 		NumWorkers:         0, // runtime.NumCPU()
 		QueueSizePerWorker: 256,
@@ -57,8 +57,8 @@ func DefaultConfig() Config {
 	}
 }
 
-// Validate checks the configuration and returns an error if invalid
-func (c *Config) Validate() error {
+// validate checks the configuration and returns an error if invalid
+func (c *Config) validate() error {
 	if c.NumWorkers < 0 {
 		return ErrInvalidConfig("NumWorkers must be >= 0")
 	}

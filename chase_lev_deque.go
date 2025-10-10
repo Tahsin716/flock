@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 )
 
-// ChaseLevDeque is a lock-free work-stealing deque
+// chaseLevDeque is a lock-free work-stealing deque
 //
 // Properties:
 // - Owner can push/pop at bottom (LIFO - newest tasks first)
@@ -13,7 +13,7 @@ import (
 // - Dynamically resizable
 //
 // Memory ordering is CRITICAL for correctness!
-type ChaseLevDeque struct {
+type chaseLevDeque struct {
 	// Padding to prevent false sharing
 	_ cacheLinePad
 
@@ -48,13 +48,13 @@ type circularArray struct {
 	buffer   []func()
 }
 
-// NewChaseLevDeque creates a new work-stealing deque
-func NewChaseLevDeque(initialCapacity int64) *ChaseLevDeque {
+// newChaseLevDeque creates a new work-stealing deque
+func newChaseLevDeque(initialCapacity int64) *chaseLevDeque {
 	if initialCapacity <= 0 {
 		initialCapacity = 16 // Default minimum
 	}
 
-	d := &ChaseLevDeque{
+	d := &chaseLevDeque{
 		top:         0,
 		bottom:      0,
 		minCapacity: initialCapacity,
@@ -86,7 +86,7 @@ func (a *circularArray) put(index int64, task func()) {
 	a.buffer[index%a.capacity] = task
 }
 
-// Push adds a task to the bottom (owner only, LIFO end)
+// push adds a task to the bottom (owner only, LIFO end)
 // NOT thread-safe - only the owning worker should call this
 //
 // Algorithm:
@@ -99,7 +99,7 @@ func (a *circularArray) put(index int64, task func()) {
 // Memory Ordering:
 // - RELEASE fence ensures task write happens-before bottom increment
 // - This synchronizes with thieves' ACQUIRE load of bottom
-func (d *ChaseLevDeque) Push(task func()) error {
+func (d *chaseLevDeque) push(task func()) error {
 	if task == nil {
 		return ErrNilTask
 	}
@@ -137,7 +137,7 @@ func (d *ChaseLevDeque) Push(task func()) error {
 	return nil
 }
 
-// Pop removes and returns a task from the bottom (owner only, LIFO)
+// pop removes and returns a task from the bottom (owner only, LIFO)
 // Returns nil if empty
 // NOT thread-safe - only the owning worker should call this
 //
@@ -150,9 +150,9 @@ func (d *ChaseLevDeque) Push(task func()) error {
 // 6. Return task
 //
 // Memory Ordering:
-// - SEQ_CST fence coordinates with Steal's SEQ_CST fence
+// - SEQ_CST fence coordinates with steal's SEQ_CST fence
 // - Critical for the last-element race condition
-func (d *ChaseLevDeque) Pop() func() {
+func (d *chaseLevDeque) pop() func() {
 	// Decrement bottom first (tentatively remove last element)
 	bottom := atomic.LoadInt64(&d.bottom) - 1
 
@@ -163,7 +163,7 @@ func (d *ChaseLevDeque) Pop() func() {
 	atomic.StoreInt64(&d.bottom, bottom)
 
 	// CRITICAL: Full memory fence (SEQ_CST)
-	// Coordinates with Steal's fence for the last-element race
+	// Coordinates with steal's fence for the last-element race
 	// Must happen after bottom decrement, before top load
 	atomic.LoadInt64(&d.bottom) // Dummy load for SEQ_CST fence
 
@@ -182,8 +182,8 @@ func (d *ChaseLevDeque) Pop() func() {
 
 	// Check if this is the last element
 	if top == bottom {
-		// Last element - race condition with Steal!
-		// Both Pop and Steal might try to take this element
+		// Last element - race condition with steal!
+		// Both pop and steal might try to take this element
 		//
 		// We use CAS to decide the winner:
 		// - If CAS succeeds: we won, return the task
@@ -207,13 +207,13 @@ func (d *ChaseLevDeque) Pop() func() {
 	return task
 }
 
-// Steal attempts to steal a task from the top (thieves, FIFO)
+// steal attempts to steal a task from the top (thieves, FIFO)
 // Returns nil if empty or if lost race with another thief/owner
 // Thread-safe - multiple thieves can call concurrently
 //
 // Algorithm:
 // 1. Load top with ACQUIRE
-// 2. Memory fence (SEQ_CST) - coordinate with Pop
+// 2. Memory fence (SEQ_CST) - coordinate with pop
 // 3. Load bottom with ACQUIRE
 // 4. Check if empty (top >= bottom)
 // 5. Load task at top position
@@ -222,15 +222,15 @@ func (d *ChaseLevDeque) Pop() func() {
 //
 // Memory Ordering:
 // - ACQUIRE on top/bottom ensures we see task writes
-// - SEQ_CST fence coordinates with Pop's fence
+// - SEQ_CST fence coordinates with pop's fence
 // - CAS provides full barrier
-func (d *ChaseLevDeque) Steal() func() {
+func (d *chaseLevDeque) steal() func() {
 	// Load top with ACQUIRE semantics
 	// Ensures we see all writes that happened-before top was written
 	top := atomic.LoadInt64(&d.top)
 
 	// CRITICAL: Full memory fence (SEQ_CST)
-	// Coordinates with Pop's fence for last-element race
+	// Coordinates with pop's fence for last-element race
 	// Ensures proper ordering of top load and bottom load
 	atomic.LoadInt64(&d.top) // Dummy load for SEQ_CST fence
 
@@ -250,7 +250,7 @@ func (d *ChaseLevDeque) Steal() func() {
 	task := array.get(top)
 
 	// Try to claim this task by incrementing top
-	// CAS handles race with other thieves and owner's Pop
+	// CAS handles race with other thieves and owner's pop
 	//
 	// If multiple thieves try to steal simultaneously:
 	// - All read same top value
@@ -267,13 +267,13 @@ func (d *ChaseLevDeque) Steal() func() {
 }
 
 // resize creates a new larger array and copies existing elements
-// Called by Push when array is full
+// Called by push when array is full
 //
 // Algorithm:
 // 1. Allocate new array (2x size)
 // 2. Copy all elements from old array
 // 3. Return new array (caller stores it atomically)
-func (d *ChaseLevDeque) resize(bottom, top int64, oldArray *circularArray) *circularArray {
+func (d *chaseLevDeque) resize(bottom, top int64, oldArray *circularArray) *circularArray {
 	// Double the capacity
 	newCapacity := oldArray.capacity * 2
 
@@ -289,9 +289,9 @@ func (d *ChaseLevDeque) resize(bottom, top int64, oldArray *circularArray) *circ
 	return newArray
 }
 
-// Size returns an estimate of the current size
+// size returns an estimate of the current size
 // This is a snapshot and may be stale immediately
-func (d *ChaseLevDeque) Size() int64 {
+func (d *chaseLevDeque) size() int64 {
 	bottom := atomic.LoadInt64(&d.bottom)
 	top := atomic.LoadInt64(&d.top)
 
@@ -305,26 +305,26 @@ func (d *ChaseLevDeque) Size() int64 {
 	return size
 }
 
-// IsEmpty returns true if the deque appears empty
+// isEmpty returns true if the deque appears empty
 // This is a snapshot and may be stale
-func (d *ChaseLevDeque) IsEmpty() bool {
-	return d.Size() == 0
+func (d *chaseLevDeque) isEmpty() bool {
+	return d.size() == 0
 }
 
-// Capacity returns the current capacity
-func (d *ChaseLevDeque) Capacity() int64 {
+// capacity returns the current capacity
+func (d *chaseLevDeque) capacity() int64 {
 	array := d.array.Load().(*circularArray)
 	return array.capacity
 }
 
-// MinCapacity returns the minimum capacity
-func (d *ChaseLevDeque) MinCapacity() int64 {
+// mincapacity returns the minimum capacity
+func (d *chaseLevDeque) mincapacity() int64 {
 	return d.minCapacity
 }
 
-// Reset clears the deque
+// reset clears the deque
 // NOT thread-safe - only call when no concurrent operations
-func (d *ChaseLevDeque) Reset() {
+func (d *chaseLevDeque) reset() {
 	atomic.StoreInt64(&d.top, 0)
 	atomic.StoreInt64(&d.bottom, 0)
 	d.array.Store(newCircularArray(d.minCapacity))

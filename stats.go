@@ -41,5 +41,5 @@ type WorkerStats struct {
 	// Capacity is the queue capacity for this specific worker.
 	Capacity int
 	// State is the current state of the worker (e.g., Running, Parked).
-	State WorkerState
+	State workerState
 }

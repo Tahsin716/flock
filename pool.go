@@ -57,15 +57,15 @@ type poolMetrics struct {
 //	)
 func NewPool(opts ...Option) (*Pool, error) {
 	// Start with default config
-	cfg := DefaultConfig()
+	cfg := defaultConfig()
 
 	// Apply user options
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
-	// Validate final configuration
-	if err := cfg.Validate(); err != nil {
+	// validate final configuration
+	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 
