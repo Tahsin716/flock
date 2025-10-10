@@ -1,7 +1,9 @@
 package flock
 
 import (
+	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -216,9 +218,10 @@ func (w *worker) executeTask(task func()) {
 				w.pool.config.PanicHandler(r)
 			} else {
 				// Default: capture stack trace silently
-				buf := make([]byte, 4096)
-				n := runtime.Stack(buf, false)
-				_ = n // Stack trace in buf[:n]
+				stackTrace := debug.Stack()
+				// Create a wrapped PoolError with worker ID and stack trace
+				wrappedErr := errWorker(w.id, fmt.Errorf("%v\n%s", r, stackTrace))
+				fmt.Printf("[flock error] %v\n", wrappedErr)
 			}
 		}
 

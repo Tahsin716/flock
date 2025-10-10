@@ -1,7 +1,8 @@
 package flock
 
 import (
-	"runtime"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -308,9 +309,10 @@ func (p *Pool) execute(task func()) {
 				p.config.PanicHandler(r)
 			} else {
 				// Default: capture stack trace silently
-				buf := make([]byte, 4096)
-				n := runtime.Stack(buf, false)
-				_ = n // Stack trace in buf[:n]
+				stackTrace := debug.Stack()
+				// Create a wrapped PoolError with stack trace
+				err := PoolError{msg: "Error running task in submission goroutine", err: fmt.Errorf("%v\n%s", r, stackTrace)}
+				fmt.Printf("[flock error] %v\n", err)
 			}
 		}
 

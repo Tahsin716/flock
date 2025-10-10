@@ -34,13 +34,13 @@ func (e *PoolError) Unwrap() error {
 	return e.err
 }
 
-// ErrInvalidConfig creates an error for invalid configuration
-func ErrInvalidConfig(msg string) error {
+// errrInvalidConfig creates an error for invalid configuration
+func errInvalidConfig(msg string) error {
 	return &PoolError{msg: "invalid config: " + msg}
 }
 
-// ErrWorker creates an error for worker-related issues
-func ErrWorker(workerID int, err error) error {
+// errWorker creates an error for worker-related issues
+func errWorker(workerID int, err error) error {
 	return &PoolError{
 		msg: fmt.Sprintf("worker %d error", workerID),
 		err: err,

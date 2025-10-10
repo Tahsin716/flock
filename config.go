@@ -60,39 +60,39 @@ func defaultConfig() Config {
 // validate checks the configuration and returns an error if invalid
 func (c *Config) validate() error {
 	if c.NumWorkers < 0 {
-		return ErrInvalidConfig("NumWorkers must be >= 0")
+		return errInvalidConfig("NumWorkers must be >= 0")
 	}
 
 	if c.NumWorkers > 10000 {
-		return ErrInvalidConfig("NumWorkers too large (>10000), likely a mistake")
+		return errInvalidConfig("NumWorkers too large (>10000), likely a mistake")
 	}
 
 	if c.QueueSizePerWorker <= 0 {
-		return ErrInvalidConfig("QueueSizePerWorker must be positive")
+		return errInvalidConfig("QueueSizePerWorker must be positive")
 	}
 
 	if c.QueueSizePerWorker&(c.QueueSizePerWorker-1) != 0 {
-		return ErrInvalidConfig("QueueSizePerWorker must be a power of 2")
+		return errInvalidConfig("QueueSizePerWorker must be a power of 2")
 	}
 
 	if c.QueueSizePerWorker > 100000 {
-		return ErrInvalidConfig("QueueSizePerWorker too large (>100000), use dynamic sizing")
+		return errInvalidConfig("QueueSizePerWorker too large (>100000), use dynamic sizing")
 	}
 
 	if c.MaxParkTime <= 0 {
-		return ErrInvalidConfig("MaxParkTime must be positive")
+		return errInvalidConfig("MaxParkTime must be positive")
 	}
 
 	if c.MaxParkTime > 1*time.Minute {
-		return ErrInvalidConfig("MaxParkTime too large (>1min), workers may appear stuck")
+		return errInvalidConfig("MaxParkTime too large (>1min), workers may appear stuck")
 	}
 
 	if c.SpinCount < 0 {
-		return ErrInvalidConfig("SpinCount must be >= 0")
+		return errInvalidConfig("SpinCount must be >= 0")
 	}
 
 	if c.SpinCount > 10000 {
-		return ErrInvalidConfig("SpinCount too large (>10000), will waste CPU")
+		return errInvalidConfig("SpinCount too large (>10000), will waste CPU")
 	}
 
 	return nil
