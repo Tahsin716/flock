@@ -1,18 +1,19 @@
 package flock
 
 import (
+	"runtime"
 	"time"
 )
 
 // Config contains all configuration options for the worker pool
 type Config struct {
 	// NumWorkers is the number of worker goroutines
-	// If 0, defaults to runtime.NumCPU()
+	// Default value runtime.NumCPU()
 	NumWorkers int
 
 	// QueueSizePerWorker is the initial size of each worker's deque (Must be a power of 2)
 	// The deque grows dynamically up to maxDequeCapacity (65536)
-	// If 0, defaults to 256
+	// Defaults value 256
 	QueueSizePerWorker int
 
 	// PanicHandler is called when a task panics
@@ -48,7 +49,7 @@ type Config struct {
 // defaultConfig returns a Config with production-ready defaults
 func defaultConfig() Config {
 	return Config{
-		NumWorkers:         0, // runtime.NumCPU()
+		NumWorkers:         runtime.NumCPU(), // runtime.NumCPU()
 		QueueSizePerWorker: 256,
 		PanicHandler:       nil,
 		MaxParkTime:        10 * time.Millisecond,
@@ -59,8 +60,8 @@ func defaultConfig() Config {
 
 // validate checks the configuration and returns an error if invalid
 func (c *Config) validate() error {
-	if c.NumWorkers < 0 {
-		return errInvalidConfig("NumWorkers must be >= 0")
+	if c.NumWorkers <= 0 {
+		return errInvalidConfig("NumWorkers must be positive")
 	}
 
 	if c.NumWorkers > 10000 {
