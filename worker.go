@@ -17,11 +17,11 @@ const (
 	StateShutdown
 )
 
-type ParkingState int32
+type parkingState int32
 
 const (
-	ParkedState ParkingState = iota
-	RunningState
+	parkedState parkingState = iota
+	runningState
 )
 
 func (s WorkerState) String() string {
@@ -39,37 +39,34 @@ func (s WorkerState) String() string {
 	}
 }
 
-// Worker represents a single worker goroutine with MPSC queue
-type Worker struct {
+// worker represents a single worker goroutine with MPSC queue
+type worker struct {
 	id   int
 	pool *Pool
 
 	// Single MPSC queue for all operations
-	// - Lock-free multi-producer (pool submits)
-	// - Single-consumer (worker pops)
-	// - Thieves also pop (lock-free via CAS)
-	queue *LockFreeQueue
+	queue *lockFreeQueue
 
 	// State management
 	state atomic.Value // WorkerState
 
 	// Metrics
 	tasksExecuted uint64 // atomic
-	tasksFailed   uint64
-	lastActive    int64 // atomic: unix nano timestamp
+	tasksFailed   uint64 // atomic
+	lastActive    int64  // atomic: unix nano timestamp
 
 	// Parking mechanism
 	parkMutex sync.Mutex
 	parkCond  *sync.Cond
-	parked    uint32 // atomic: 0 = currently parked
+	parked    uint32 // atomic: 0 = running, 1 = parked
 }
 
 // newWorker creates a new worker with MPSC queue
-func newWorker(id int, pool *Pool, queueSize int) *Worker {
-	w := &Worker{
+func newWorker(id int, pool *Pool, queueSize int) *worker {
+	w := &worker{
 		id:         id,
 		pool:       pool,
-		queue:      New(queueSize), // MPSC lock-free queue
+		queue:      newQueue(queueSize),
 		lastActive: time.Now().UnixNano(),
 	}
 	w.parkCond = sync.NewCond(&w.parkMutex)
@@ -78,7 +75,7 @@ func newWorker(id int, pool *Pool, queueSize int) *Worker {
 }
 
 // run is the main worker loop
-func (w *Worker) run() {
+func (w *worker) run() {
 	if w.pool.config.PinWorkerThreads {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
@@ -95,12 +92,12 @@ func (w *Worker) run() {
 		if task == nil {
 			// Check shutdown
 			state := w.pool.state.Load().(PoolState)
-			if state == PoolStateStopped {
+			if state == poolStateStopped {
 				break
 			}
 
 			// During draining, exit if queue empty
-			if state == PoolStateDraining && w.queue.IsEmpty() {
+			if state == poolStateDraining && w.queue.isEmpty() {
 				break
 			}
 
@@ -123,9 +120,9 @@ func (w *Worker) run() {
 }
 
 // findTask attempts to find a task using priority-based search
-func (w *Worker) findTask() func() {
+func (w *worker) findTask() func() {
 	// Priority 1: Own queue (FIFO - single consumer)
-	if task := w.queue.Pop(); task != nil {
+	if task := w.queue.pop(); task != nil {
 		return task
 	}
 
@@ -134,7 +131,7 @@ func (w *Worker) findTask() func() {
 }
 
 // parkAndWait parks the worker until work is available
-func (w *Worker) parkAndWait() func() {
+func (w *worker) parkAndWait() func() {
 	// Phase 1: Active spinning
 	if task := w.spinForWork(); task != nil {
 		return task
@@ -145,11 +142,11 @@ func (w *Worker) parkAndWait() func() {
 }
 
 // spinForWork attempts to find work through active spinning
-func (w *Worker) spinForWork() func() {
+func (w *worker) spinForWork() func() {
 	w.state.Store(StateSpinning)
 
 	for i := 0; i < w.pool.config.SpinCount; i++ {
-		if task := w.queue.Pop(); task != nil {
+		if task := w.queue.pop(); task != nil {
 			w.state.Store(StateRunning)
 			return task
 		}
@@ -160,22 +157,22 @@ func (w *Worker) spinForWork() func() {
 }
 
 // parkWithTimeout parks the worker and waits for work or timeout
-func (w *Worker) parkWithTimeout() func() {
+func (w *worker) parkWithTimeout() func() {
 	w.parkMutex.Lock()
 	defer w.parkMutex.Unlock()
 
 	// Set parked state AFTER acquiring lock to prevent lost wakeups
 	w.state.Store(StateParked)
-	atomic.StoreUint32(&w.parked, uint32(ParkedState))
+	atomic.StoreUint32(&w.parked, uint32(parkedState))
 
 	// Ensure we reset state even on early return
 	defer func() {
-		atomic.StoreUint32(&w.parked, uint32(RunningState))
+		atomic.StoreUint32(&w.parked, uint32(runningState))
 		w.state.Store(StateRunning)
 	}()
 
 	// Double-check for work while holding lock (prevents lost wakeup)
-	if task := w.queue.Pop(); task != nil {
+	if task := w.queue.pop(); task != nil {
 		return task
 	}
 
@@ -183,11 +180,11 @@ func (w *Worker) parkWithTimeout() func() {
 	w.waitForSignal()
 
 	// Check for work after waking
-	return w.queue.Pop()
+	return w.queue.pop()
 }
 
 // waitForSignal waits for a signal or timeout using a timer
-func (w *Worker) waitForSignal() {
+func (w *worker) waitForSignal() {
 	timer := time.AfterFunc(w.pool.config.MaxParkTime, func() {
 		w.parkMutex.Lock()
 		w.parkCond.Signal()
@@ -199,9 +196,9 @@ func (w *Worker) waitForSignal() {
 }
 
 // signal wakes up a parked worker
-func (w *Worker) signal() {
+func (w *worker) signal() {
 	// Fast path: only signal if actually parked
-	if atomic.LoadUint32(&w.parked) == uint32(ParkedState) {
+	if atomic.LoadUint32(&w.parked) == uint32(parkedState) {
 		w.parkMutex.Lock()
 		w.parkCond.Signal()
 		w.parkMutex.Unlock()
@@ -209,11 +206,12 @@ func (w *Worker) signal() {
 }
 
 // executeTask executes a task with panic recovery and latency tracking
-func (w *Worker) executeTask(task func()) {
+func (w *worker) executeTask(task func()) {
 	startTime := time.Now()
 
 	defer func() {
 		if r := recover(); r != nil {
+			atomic.AddUint64(&w.tasksFailed, 1)
 			if w.pool.config.PanicHandler != nil {
 				w.pool.config.PanicHandler(r)
 			} else {
@@ -237,9 +235,9 @@ func (w *Worker) executeTask(task func()) {
 }
 
 // drainQueue processes remaining tasks during shutdown
-func (w *Worker) drainQueue() {
+func (w *worker) drainQueue() {
 	for {
-		task := w.queue.Pop()
+		task := w.queue.pop()
 		if task == nil {
 			break
 		}
@@ -248,6 +246,6 @@ func (w *Worker) drainQueue() {
 }
 
 // getState returns the current worker state
-func (w *Worker) getState() WorkerState {
+func (w *worker) getState() WorkerState {
 	return w.state.Load().(WorkerState)
 }

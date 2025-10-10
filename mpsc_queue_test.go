@@ -18,7 +18,7 @@ func TestLockFreeQueue_NewPanicsOnInvalidCapacity(t *testing.T) {
 			t.Error("Expected panic on zero capacity")
 		}
 	}()
-	New(0)
+	newQueue(0)
 }
 
 func TestLockFreeQueue_NewPanicsOnNonPowerOfTwo(t *testing.T) {
@@ -27,27 +27,27 @@ func TestLockFreeQueue_NewPanicsOnNonPowerOfTwo(t *testing.T) {
 			t.Error("Expected panic on non-power-of-2 capacity")
 		}
 	}()
-	New(7) // Not a power of 2
+	newQueue(7) // Not a power of 2
 }
 
 func TestLockFreeQueue_PushPop(t *testing.T) {
-	q := New(16)
+	q := newQueue(16)
 
 	// Push a task
 	executed := false
 	task := func() { executed = true }
 
-	if !q.TryPush(task) {
+	if !q.tryPush(task) {
 		t.Fatal("Failed to push to empty queue")
 	}
 
 	// Check size
-	if q.Size() != 1 {
-		t.Errorf("Expected size 1, got %d", q.Size())
+	if q.size() != 1 {
+		t.Errorf("Expected size 1, got %d", q.size())
 	}
 
-	// Pop the task
-	popped := q.Pop()
+	// pop the task
+	popped := q.pop()
 	if popped == nil {
 		t.Fatal("Failed to pop from queue")
 	}
@@ -59,77 +59,77 @@ func TestLockFreeQueue_PushPop(t *testing.T) {
 	}
 
 	// Check empty
-	if q.Size() != 0 {
-		t.Errorf("Expected size 0 after pop, got %d", q.Size())
+	if q.size() != 0 {
+		t.Errorf("Expected size 0 after pop, got %d", q.size())
 	}
 }
 
 func TestLockFreeQueue_PopFromEmpty(t *testing.T) {
-	q := New(16)
+	q := newQueue(16)
 
-	task := q.Pop()
+	task := q.pop()
 	if task != nil {
 		t.Error("Expected nil from empty queue")
 	}
 }
 
 func TestLockFreeQueue_PushNil(t *testing.T) {
-	q := New(16)
+	q := newQueue(16)
 
-	if q.TryPush(nil) {
+	if q.tryPush(nil) {
 		t.Error("Should not be able to push nil")
 	}
 }
 
 func TestLockFreeQueue_FillAndDrain(t *testing.T) {
 	capacity := 16
-	q := New(capacity)
+	q := newQueue(capacity)
 
 	// Fill queue (capacity - 1, as we leave one slot empty)
 	for i := 0; i < capacity-1; i++ {
 		task := func() {}
-		if !q.TryPush(task) {
+		if !q.tryPush(task) {
 			t.Fatalf("Failed to push at index %d", i)
 		}
 	}
 
 	// Check size
-	if q.Size() != capacity-1 {
-		t.Errorf("Expected size %d, got %d", capacity-1, q.Size())
+	if q.size() != capacity-1 {
+		t.Errorf("Expected size %d, got %d", capacity-1, q.size())
 	}
 
 	// Should be full now
-	if q.TryPush(func() {}) {
+	if q.tryPush(func() {}) {
 		t.Error("Should not be able to push to full queue")
 	}
 
 	// Drain all
 	for i := 0; i < capacity-1; i++ {
-		task := q.Pop()
+		task := q.pop()
 		if task == nil {
 			t.Fatalf("Failed to pop at index %d", i)
 		}
 	}
 
 	// Should be empty
-	if q.Pop() != nil {
+	if q.pop() != nil {
 		t.Error("Expected nil from empty queue")
 	}
 }
 
 func TestLockFreeQueue_WrapAround(t *testing.T) {
-	q := New(8)
+	q := newQueue(8)
 
 	// Push and pop multiple times to test wrap-around
 	for i := 0; i < 100; i++ {
 		count := 0
 		task := func() { count++ }
 
-		if !q.TryPush(task) {
+		if !q.tryPush(task) {
 			t.Fatalf("Failed to push at iteration %d", i)
 		}
 
-		popped := q.Pop()
+		popped := q.pop()
 		if popped == nil {
 			t.Fatalf("Failed to pop at iteration %d", i)
 		}
@@ -146,7 +146,7 @@ func TestLockFreeQueue_WrapAround(t *testing.T) {
 // ============================================================================
 
 func TestLockFreeQueue_ConcurrentPushPop(t *testing.T) {
-	q := New(1024)
+	q := newQueue(1024)
 	numProducers := 4
 	itemsPerProducer := 10000
 
@@ -160,7 +160,7 @@ func TestLockFreeQueue_ConcurrentPushPop(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < itemsPerProducer; j++ {
 				// Keep trying until successful
-				for !q.TryPush(func() {}) {
+				for !q.tryPush(func() {}) {
 					runtime.Gosched()
 				}
 				atomic.AddInt64(&pushed, 1)
@@ -174,7 +174,7 @@ func TestLockFreeQueue_ConcurrentPushPop(t *testing.T) {
 		defer wg.Done()
 		expected := int64(numProducers * itemsPerProducer)
 		for atomic.LoadInt64(&popped) < expected {
-			if task := q.Pop(); task != nil {
+			if task := q.pop(); task != nil {
 				atomic.AddInt64(&popped, 1)
 				task()
 			} else {
@@ -189,8 +189,8 @@ func TestLockFreeQueue_ConcurrentPushPop(t *testing.T) {
 		t.Errorf("Lost tasks: pushed %d, popped %d", pushed, popped)
 	}
 
-	if !q.IsEmpty() {
-		t.Errorf("Queue not empty after test, size: %d", q.Size())
+	if !q.isEmpty() {
+		t.Errorf("Queue not empty after test, size: %d", q.size())
 	}
 }
 
@@ -199,7 +199,7 @@ func TestLockFreeQueue_HighContention(t *testing.T) {
 		t.Skip("Skipping high contention test in short mode")
 	}
 
-	q := New(2048)
+	q := newQueue(2048)
 	numProducers := runtime.NumCPU()
 	itemsPerProducer := 50000
 
@@ -213,7 +213,7 @@ func TestLockFreeQueue_HighContention(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < itemsPerProducer; j++ {
-				for !q.TryPush(func() {}) {
+				for !q.tryPush(func() {}) {
 					runtime.Gosched()
 				}
 				atomic.AddInt64(&pushed, 1)
@@ -230,7 +230,7 @@ func TestLockFreeQueue_HighContention(t *testing.T) {
 	// Single consumer
 	expected := int64(numProducers * itemsPerProducer)
 	for {
-		if task := q.Pop(); task != nil {
+		if task := q.pop(); task != nil {
 			atomic.AddInt64(&popped, 1)
 			// Check if we've processed all items
 			if atomic.LoadInt64(&popped) >= expected {
@@ -240,7 +240,7 @@ func TestLockFreeQueue_HighContention(t *testing.T) {
 			// Queue is empty - check if producers are done
 			if atomic.LoadInt32(&producersDone) == 1 {
 				// Producers done, but double-check queue is empty
-				if q.Pop() == nil {
+				if q.pop() == nil {
 					break
 				}
 			} else {
@@ -267,7 +267,7 @@ func TestLockFreeQueue_StressTest(t *testing.T) {
 		t.Skip("Skipping stress test in short mode")
 	}
 
-	q := New(2048)
+	q := newQueue(2048)
 	duration := 3 * time.Second
 
 	var pushed, popped int64
@@ -282,7 +282,7 @@ func TestLockFreeQueue_StressTest(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					if q.TryPush(func() {}) {
+					if q.tryPush(func() {}) {
 						atomic.AddInt64(&pushed, 1)
 					}
 				}
@@ -296,12 +296,12 @@ func TestLockFreeQueue_StressTest(t *testing.T) {
 			select {
 			case <-stop:
 				// Drain remaining
-				for q.Pop() != nil {
+				for q.pop() != nil {
 					atomic.AddInt64(&popped, 1)
 				}
 				return
 			default:
-				if task := q.Pop(); task != nil {
+				if task := q.pop(); task != nil {
 					atomic.AddInt64(&popped, 1)
 				}
 			}

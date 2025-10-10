@@ -15,21 +15,21 @@ import (
 // Memory ordering is CRITICAL for correctness!
 type ChaseLevDeque struct {
 	// Padding to prevent false sharing
-	_ CacheLinePad
+	_ cacheLinePad
 
 	// top is the steal end (incremented by thieves via CAS)
 	// Multiple thieves compete to increment this
 	top int64
 
 	// Padding between top and bottom
-	_ CacheLinePad
+	_ cacheLinePad
 
 	// bottom is the owner end (modified only by owner)
 	// Owner has exclusive access to bottom
 	bottom int64
 
 	// Padding after bottom
-	_ CacheLinePad
+	_ cacheLinePad
 
 	// array is the underlying circular buffer
 	// Can be replaced with a larger one when full

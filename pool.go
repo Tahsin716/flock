@@ -1,27 +1,25 @@
 package flock
 
 import (
-	"context"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
-	_ "unsafe" // for go:linkname
 )
 
 // PoolState represents pool lifecycle states
 type PoolState uint32
 
 const (
-	PoolStateRunning PoolState = iota
-	PoolStateDraining
-	PoolStateStopped
+	poolStateRunning PoolState = iota
+	poolStateDraining
+	poolStateStopped
 )
 
-// Pool is a high-performance worker pool with work stealing
+// Pool is a high-performance worker pool
 type Pool struct {
 	config  Config
-	workers []*Worker
+	workers []*worker
 
 	// Lifecycle management
 	state    atomic.Value // PoolState
@@ -48,7 +46,15 @@ type poolMetrics struct {
 	fallback  uint64 // atomic
 }
 
-// NewPool creates a new worker pool
+// NewPool creates a new worker pool with the given options.
+// It returns an error if the configuration is invalid.
+//
+// Example:
+//
+//	pool, err := flock.NewPool(
+//	    flock.WithNumWorkers(4),
+//	    flock.WithQueueSizePerWorker(256),
+//	)
 func NewPool(opts ...Option) (*Pool, error) {
 	// Start with default config
 	cfg := DefaultConfig()
@@ -65,9 +71,9 @@ func NewPool(opts ...Option) (*Pool, error) {
 
 	pool := &Pool{
 		config:  cfg,
-		workers: make([]*Worker, cfg.NumWorkers),
+		workers: make([]*worker, cfg.NumWorkers),
 	}
-	pool.state.Store(PoolStateRunning)
+	pool.state.Store(poolStateRunning)
 
 	// Initialize and start workers
 	for i := 0; i < cfg.NumWorkers; i++ {
@@ -76,28 +82,39 @@ func NewPool(opts ...Option) (*Pool, error) {
 
 	for _, w := range pool.workers {
 		pool.wg.Add(1)
-		go func(worker *Worker) {
+		go func(wk *worker) {
 			defer pool.wg.Done()
-			worker.run()
+			wk.run()
 		}(w)
 	}
 
 	return pool, nil
 }
 
-// Submit never fails - executes in caller's goroutine if queues full
+// Submit submits a task to the pool. It never returns an error for queue full -
+// instead it executes the task in the caller's goroutine if all worker queues are full.
+//
+// Returns ErrNilTask if task is nil.
+// Returns ErrPoolShutdown if the pool has been shut down.
+//
+// Example:
+//
+//	err := pool.Submit(func() {
+//	    fmt.Println("Task executed")
+//	})
 func (p *Pool) Submit(task func()) error {
 	if task == nil {
 		return ErrNilTask
 	}
 
 	state := p.state.Load().(PoolState)
-	if state == PoolStateStopped {
+	if state == poolStateStopped {
 		return ErrPoolShutdown
 	}
 
-	atomic.AddUint64(&p.metrics.submitted, 1)
+	// Add to waitgroup BEFORE incrementing submitted to prevent races
 	p.submitWg.Add(1)
+	atomic.AddUint64(&p.metrics.submitted, 1)
 
 	if p.tryFastSubmit(task) {
 		return nil
@@ -113,27 +130,6 @@ func (p *Pool) Submit(task func()) error {
 	return nil
 }
 
-// TrySubmit returns error if queues full
-func (p *Pool) TrySubmit(task func()) error {
-	if task == nil {
-		return ErrInvalidConfig("task cannot be nil")
-	}
-
-	state := p.state.Load().(PoolState)
-	if state == PoolStateStopped {
-		return ErrPoolShutdown
-	}
-
-	atomic.AddUint64(&p.metrics.submitted, 1)
-
-	if p.tryFastSubmit(task) {
-		return nil
-	}
-
-	atomic.AddUint64(&p.metrics.rejected, 1)
-	return ErrQueueFull
-}
-
 // tryFastSubmit attempts to submit to worker queues via MPSC
 func (p *Pool) tryFastSubmit(task func()) bool {
 	numWorkers := len(p.workers)
@@ -144,10 +140,10 @@ func (p *Pool) tryFastSubmit(task func()) bool {
 
 	for i := 0; i < numWorkers; i++ {
 		idx := (startIdx + i) % numWorkers
-		worker := p.workers[idx]
+		wk := p.workers[idx]
 
-		if worker.queue.TryPush(task) {
-			worker.signal()
+		if wk.queue.tryPush(task) {
+			wk.signal()
 			return true
 		}
 	}
@@ -155,80 +151,58 @@ func (p *Pool) tryFastSubmit(task func()) bool {
 	return false
 }
 
-// SubmitWithContext submits with context support
-func (p *Pool) SubmitWithContext(ctx context.Context, task func()) {
-	if ctx == nil {
-		p.Submit(task)
-		return
-	}
-
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-
-	wrapper := func() {
-		if ctx.Err() != nil {
-			return
-		}
-		task()
-	}
-
-	p.Submit(wrapper)
-}
-
-// TrySubmitWithContext is TrySubmit with context
-func (p *Pool) TrySubmitWithContext(ctx context.Context, task func()) error {
-	if ctx == nil {
-		return p.TrySubmit(task)
-	}
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	wrapper := func() {
-		if ctx.Err() != nil {
-			return
-		}
-		task()
-	}
-
-	return p.TrySubmit(wrapper)
-}
-
-// Shutdown stops the pool, and waits for all pending tasks in queue to complete
+// Shutdown stops the pool. If graceful is true, it waits for all queued tasks
+// to complete. If false, it stops immediately after current tasks finish.
+//
+// Multiple calls to Shutdown are safe and will be ignored after the first call.
+//
+// Example:
+//
+//	pool.Shutdown(true)  // Wait for all tasks
+//	pool.Shutdown(false) // Stop immediately
 func (p *Pool) Shutdown(graceful bool) {
 	if graceful {
-		if !p.state.CompareAndSwap(PoolStateRunning, PoolStateDraining) {
+		if !p.state.CompareAndSwap(poolStateRunning, poolStateDraining) {
 			return
 		}
 	} else {
 		currentState := p.state.Load().(PoolState)
-		if currentState == PoolStateStopped {
+		if currentState == poolStateStopped {
 			return
 		}
-		p.state.Store(PoolStateStopped)
+		p.state.Store(poolStateStopped)
 
-		for _, worker := range p.workers {
-			worker.signal()
+		for _, wk := range p.workers {
+			wk.signal()
 		}
 	}
 
 	p.wg.Wait()
-	p.state.Store(PoolStateStopped)
+	p.state.Store(poolStateStopped)
 }
 
-// Wait blocks until all tasks complete
-// it does not shutdown the pool
+// Wait blocks until all submitted tasks have completed.
+// It does not shut down the pool - the pool remains available for new tasks.
+//
+// Example:
+//
+//	pool.Submit(task1)
+//	pool.Submit(task2)
+//	pool.Wait() // Blocks until task1 and task2 complete
 func (p *Pool) Wait() {
 	p.submitWg.Wait()
 }
 
-// Stats returns pool statistics
+// Stats returns a snapshot of pool statistics including task counts,
+// latency metrics, and per-worker statistics.
+//
+// Note: Stats are collected without locks, so values may be slightly
+// inconsistent during concurrent operations.
+//
+// Example:
+//
+//	stats := pool.Stats()
+//	fmt.Printf("Completed: %d/%d\n", stats.Completed, stats.Submitted)
 func (p *Pool) Stats() Stats {
 	submitted := atomic.LoadUint64(&p.metrics.submitted)
 	completed := atomic.LoadUint64(&p.metrics.completed)
@@ -240,19 +214,19 @@ func (p *Pool) Stats() Stats {
 	totalDepth := int64(0)
 	totalCapacity := int64(0)
 
-	for i, worker := range p.workers {
-		depth := worker.queue.Size()
-		capacity := worker.queue.Capacity()
+	for i, wk := range p.workers {
+		depth := wk.queue.size()
+		capacity := wk.queue.capacity()
 
 		totalDepth += int64(depth)
 		totalCapacity += int64(capacity)
 
 		workerStats[i] = WorkerStats{
 			WorkerID:      i,
-			TasksExecuted: atomic.LoadUint64(&worker.tasksExecuted),
-			TasksFailed:   atomic.LoadUint64(&worker.tasksFailed),
+			TasksExecuted: atomic.LoadUint64(&wk.tasksExecuted),
+			TasksFailed:   atomic.LoadUint64(&wk.tasksFailed),
 			Capacity:      capacity,
-			State:         worker.getState(),
+			State:         wk.getState(),
 		}
 	}
 
@@ -287,7 +261,27 @@ func (p *Pool) Stats() Stats {
 	}
 }
 
-// recordLatency records task latency
+// IsShutdown returns true if the pool has been shut down.
+//
+// Example:
+//
+//	if pool.IsShutdown() {
+//	    fmt.Println("Pool is no longer accepting tasks")
+//	}
+func (p *Pool) IsShutdown() bool {
+	return p.state.Load().(PoolState) == poolStateStopped
+}
+
+// NumWorkers returns the number of workers in the pool.
+//
+// Example:
+//
+//	fmt.Printf("Pool has %d workers\n", pool.NumWorkers())
+func (p *Pool) NumWorkers() int {
+	return len(p.workers)
+}
+
+// recordLatency records task execution latency
 func (p *Pool) recordLatency(duration time.Duration) {
 	micros := uint64(duration.Microseconds())
 
@@ -305,35 +299,11 @@ func (p *Pool) recordLatency(duration time.Duration) {
 	}
 }
 
-// GetWorkerStats returns stats for specific worker
-func (p *Pool) GetWorkerStats(workerID int) (WorkerStats, error) {
-	if workerID < 0 || workerID >= len(p.workers) {
-		return WorkerStats{}, ErrInvalidConfig("invalid worker ID")
-	}
-
-	worker := p.workers[workerID]
-	return WorkerStats{
-		WorkerID:      workerID,
-		TasksExecuted: atomic.LoadUint64(&worker.tasksExecuted),
-		TasksFailed:   atomic.LoadUint64(&worker.tasksFailed),
-		Capacity:      worker.queue.Capacity(),
-		State:         worker.getState(),
-	}, nil
-}
-
-// IsShutdown returns true if pool is shutdown
-func (p *Pool) IsShutdown() bool {
-	return p.state.Load().(PoolState) == PoolStateStopped
-}
-
-// NumWorkers returns number of workers
-func (p *Pool) NumWorkers() int {
-	return len(p.workers)
-}
-
+// execute runs a task with panic recovery
 func (p *Pool) execute(task func()) {
 	defer func() {
 		if r := recover(); r != nil {
+			atomic.AddUint64(&p.workers[0].tasksFailed, 1) // Track panic
 			if p.config.PanicHandler != nil {
 				p.config.PanicHandler(r)
 			} else {

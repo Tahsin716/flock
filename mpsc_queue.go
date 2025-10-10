@@ -5,30 +5,30 @@ import (
 	"unsafe"
 )
 
-// CacheLinePad prevents false sharing by padding to cache line size (64 bytes)
-type CacheLinePad struct {
+// cacheLinePad prevents false sharing by padding to cache line size (64 bytes)
+type cacheLinePad struct {
 	_ [64]byte
 }
 
-// LockFreeQueue is a bounded, lock-free, MPSC (Multi-Producer Single-Consumer) queue
+// lockFreeQueue is a bounded, lock-free, MPSC (Multi-Producer Single-Consumer) queue
 // Multiple goroutines can safely push concurrently, but only one should pop
-type LockFreeQueue struct {
+type lockFreeQueue struct {
 	// Padding to prevent false sharing
-	_ CacheLinePad
+	_ cacheLinePad
 
 	// head is the consumer index (only modified by single consumer/worker)
 	// Always incremented, never decremented
 	head uint64
 
 	// Padding between head and tail (different cache lines)
-	_ CacheLinePad
+	_ cacheLinePad
 
 	// tail is the producer index (modified by multiple submitters via CAS)
 	// Always incremented, never decremented
 	tail uint64
 
 	// Padding after tail
-	_ CacheLinePad
+	_ cacheLinePad
 
 	// buffer holds the actual task functions
 	buffer []unsafe.Pointer
@@ -37,13 +37,13 @@ type LockFreeQueue struct {
 	// Only works because size is power of 2
 	mask uint64
 
-	// size is the capacity of the queue
-	size uint64
+	// queueSize is the capacity of the queue
+	queueSize uint64
 }
 
-// New creates a new lock-free queue with the given capacity
+// newQueue creates a new lock-free queue with the given capacity
 // Capacity MUST be a power of 2 for the bitwise modulo optimization to work
-func New(capacity int) *LockFreeQueue {
+func newQueue(capacity int) *lockFreeQueue {
 	if capacity <= 0 {
 		panic("capacity must be positive")
 	}
@@ -53,19 +53,19 @@ func New(capacity int) *LockFreeQueue {
 		panic("capacity must be a power of 2")
 	}
 
-	return &LockFreeQueue{
-		buffer: make([]unsafe.Pointer, capacity),
-		mask:   uint64(capacity - 1),
-		size:   uint64(capacity),
-		head:   0,
-		tail:   0,
+	return &lockFreeQueue{
+		buffer:    make([]unsafe.Pointer, capacity),
+		mask:      uint64(capacity - 1),
+		queueSize: uint64(capacity),
+		head:      0,
+		tail:      0,
 	}
 }
 
-// TryPush attempts to push a task to the queue
+// tryPush attempts to push a task to the queue
 // Returns true if successful, false if queue is full
 // Thread-safe for multiple producers via CAS
-func (q *LockFreeQueue) TryPush(task func()) bool {
+func (q *lockFreeQueue) tryPush(task func()) bool {
 	if task == nil {
 		return false
 	}
@@ -78,7 +78,7 @@ func (q *LockFreeQueue) TryPush(task func()) bool {
 		head := atomic.LoadUint64(&q.head)
 
 		// Check if full (leave one slot empty)
-		if tail-head >= q.size-1 {
+		if tail-head >= q.queueSize-1 {
 			return false
 		}
 
@@ -87,8 +87,7 @@ func (q *LockFreeQueue) TryPush(task func()) bool {
 			// We own this slot now
 			index := tail & q.mask
 
-			// Store the task with release semantics
-			// This ensures the task is visible before the tail increment is seen
+			// Store the task
 			atomic.StorePointer(&q.buffer[index], taskPtr)
 
 			return true
@@ -97,14 +96,14 @@ func (q *LockFreeQueue) TryPush(task func()) bool {
 	}
 }
 
-// Pop removes and returns a task from the queue
+// pop removes and returns a task from the queue
 // Returns nil if queue is empty
 // NOT thread-safe - only single consumer should call this
-func (q *LockFreeQueue) Pop() func() {
+func (q *lockFreeQueue) pop() func() {
 	// Load head first
 	head := atomic.LoadUint64(&q.head)
 
-	// Then load tail with acquire semantics
+	// Then load tail
 	tail := atomic.LoadUint64(&q.tail)
 
 	// Check if empty
@@ -115,13 +114,11 @@ func (q *LockFreeQueue) Pop() func() {
 	// Get the index
 	index := head & q.mask
 
-	// Load the task with acquire semantics
-	// This ensures we see the task that was stored by the producer
+	// Load the task
 	taskPtr := atomic.LoadPointer(&q.buffer[index])
 
 	if taskPtr == nil {
 		// This shouldn't happen in correct usage
-		// but be defensive
 		return nil
 	}
 
@@ -136,9 +133,9 @@ func (q *LockFreeQueue) Pop() func() {
 	return task
 }
 
-// Size returns the current number of items in the queue
+// size returns the current number of items in the queue
 // This is an estimate and may be stale due to concurrent operations
-func (q *LockFreeQueue) Size() int {
+func (q *lockFreeQueue) size() int {
 	head := atomic.LoadUint64(&q.head)
 	tail := atomic.LoadUint64(&q.tail)
 
@@ -149,28 +146,28 @@ func (q *LockFreeQueue) Size() int {
 	return int(tail - head)
 }
 
-// IsEmpty returns true if the queue appears empty
-func (q *LockFreeQueue) IsEmpty() bool {
+// isEmpty returns true if the queue appears empty
+func (q *lockFreeQueue) isEmpty() bool {
 	head := atomic.LoadUint64(&q.head)
 	tail := atomic.LoadUint64(&q.tail)
 	return head >= tail
 }
 
-// Capacity returns the maximum capacity of the queue
-func (q *LockFreeQueue) Capacity() int {
-	return int(q.size)
+// capacity returns the maximum capacity of the queue
+func (q *lockFreeQueue) capacity() int {
+	return int(q.queueSize)
 }
 
-// IsFull returns true if the queue appears full
-func (q *LockFreeQueue) IsFull() bool {
+// isFull returns true if the queue appears full
+func (q *lockFreeQueue) isFull() bool {
 	head := atomic.LoadUint64(&q.head)
 	tail := atomic.LoadUint64(&q.tail)
-	return tail-head >= q.size-1
+	return tail-head >= q.queueSize-1
 }
 
-// Reset clears all items from the queue
+// reset clears all items from the queue
 // NOT thread-safe - only call when no concurrent operations
-func (q *LockFreeQueue) Reset() {
+func (q *lockFreeQueue) reset() {
 	// Clear all slots
 	for i := range q.buffer {
 		atomic.StorePointer(&q.buffer[i], nil)
