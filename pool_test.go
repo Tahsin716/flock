@@ -251,3 +251,99 @@ func TestPool_PanicRecovery_CustomHandler(t *testing.T) {
 		t.Errorf("Expected 'custom panic', got %v", recovered)
 	}
 }
+
+// ============================================================================
+// Shutdown Tests
+// ============================================================================
+
+func TestPool_Shutdown_Graceful(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(2))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+
+	var completed atomic.Int32
+	for i := 0; i < 100; i++ {
+		pool.Submit(func() {
+			time.Sleep(time.Millisecond)
+			completed.Add(1)
+		})
+	}
+
+	// Graceful shutdown waits for tasks
+	pool.Shutdown(true)
+
+	if completed.Load() != 100 {
+		t.Errorf("Expected 100 completions, got %d", completed.Load())
+	}
+
+	if !pool.IsShutdown() {
+		t.Error("Pool should be shutdown")
+	}
+}
+
+// TestPool_Shutdown_Immediate tests that immediate shutdown is fast and doesn't wait
+func TestPool_Shutdown_Immediate(t *testing.T) {
+	pool, err := NewPool(
+		WithNumWorkers(2),
+		WithQueueSizePerWorker(1024),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+
+	// Submit many slow tasks
+	for i := 0; i < 100; i++ {
+		pool.Submit(func() {
+			time.Sleep(100 * time.Millisecond)
+		})
+	}
+
+	// Give some tasks time to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Immediate shutdown should be FAST (not wait for all 100 * 100ms = 10s)
+	start := time.Now()
+	pool.Shutdown(false)
+	duration := time.Since(start)
+
+	if !pool.IsShutdown() {
+		t.Error("Pool should be shutdown")
+	}
+
+	if duration > 500*time.Millisecond {
+		t.Errorf("Immediate shutdown took too long: %v (expected <500ms)", duration)
+	}
+
+	stats := pool.Stats()
+
+	// Most tasks should be rejected (not completed)
+	// Only the 2-3 tasks that started should complete
+	if stats.Completed > 10 {
+		t.Logf("Warning: %d tasks completed (expected ~2-5)", stats.Completed)
+	}
+
+	// Dropped should account for unexecuted tasks
+	if stats.Dropped == 0 {
+		t.Error("Expected some rejected tasks after immediate shutdown")
+	}
+
+	t.Logf("Shutdown time: %v, Submitted: %d, Completed: %d, Dropped: %d",
+		duration, stats.Submitted, stats.Completed, stats.Dropped)
+}
+
+func TestPool_Shutdown_Multiple(t *testing.T) {
+	pool, err := NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+
+	// Multiple shutdowns should be safe
+	pool.Shutdown(true)
+	pool.Shutdown(true)
+	pool.Shutdown(false)
+
+	if !pool.IsShutdown() {
+		t.Error("Pool should be shutdown")
+	}
+}

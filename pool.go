@@ -41,11 +41,11 @@ type Pool struct {
 
 // poolMetrics tracks pool-wide statistics
 type poolMetrics struct {
-	submitted      uint64 // atomic
-	completed      uint64 // atomic
-	rejected       uint64 // atomic
-	fallback       uint64 // atomic
-	fallbackFailed uint64 // atomic
+	submitted uint64 // atomic
+	completed uint64 // atomic
+	failed    uint64 // atomic
+	dropped   uint64 // atomic
+	fallback  uint64 // atomic
 }
 
 // NewPool creates a new worker pool with the given options.
@@ -110,7 +110,7 @@ func (p *Pool) Submit(task func()) error {
 	}
 
 	state := p.state.Load().(PoolState)
-	if state == poolStateStopped {
+	if state == poolStateStopped || state == poolStateDraining {
 		return ErrPoolShutdown
 	}
 
@@ -123,12 +123,11 @@ func (p *Pool) Submit(task func()) error {
 	}
 
 	// Fallback: execute in new goroutine
+	atomic.AddUint64(&p.metrics.fallback, 1)
 	go func() {
-		atomic.AddUint64(&p.metrics.fallback, 1)
 		startTime := time.Now()
 		p.execute(task)
 		p.recordLatency(time.Since(startTime))
-		atomic.AddUint64(&p.metrics.completed, 1)
 	}()
 
 	return nil
@@ -169,6 +168,8 @@ func (p *Pool) Shutdown(graceful bool) {
 		if !p.state.CompareAndSwap(poolStateRunning, poolStateDraining) {
 			return
 		}
+		// Wait for workers to drain queues
+		p.wg.Wait()
 	} else {
 		currentState := p.state.Load().(PoolState)
 		if currentState == poolStateStopped {
@@ -176,12 +177,15 @@ func (p *Pool) Shutdown(graceful bool) {
 		}
 		p.state.Store(poolStateStopped)
 
+		// Wake up all parked workers
 		for _, wk := range p.workers {
 			wk.signal()
 		}
+
+		// Wait for workers to exit
+		p.wg.Wait()
 	}
 
-	p.wg.Wait()
 	p.state.Store(poolStateStopped)
 }
 
@@ -210,9 +214,9 @@ func (p *Pool) Wait() {
 func (p *Pool) Stats() Stats {
 	submitted := atomic.LoadUint64(&p.metrics.submitted)
 	completed := atomic.LoadUint64(&p.metrics.completed)
-	rejected := atomic.LoadUint64(&p.metrics.rejected)
+	dropped := atomic.LoadUint64(&p.metrics.dropped)
 	fallback := atomic.LoadUint64(&p.metrics.fallback)
-	inFlight := submitted - completed - rejected
+	inFlight := submitted - completed - dropped
 
 	workerStats := make([]WorkerStats, len(p.workers))
 	totalDepth := int64(0)
@@ -252,7 +256,7 @@ func (p *Pool) Stats() Stats {
 	return Stats{
 		Submitted:          submitted,
 		Completed:          completed,
-		Rejected:           rejected,
+		Dropped:            dropped,
 		FallbackExecuted:   fallback,
 		InFlight:           inFlight,
 		Utilization:        utilization,
@@ -307,20 +311,19 @@ func (p *Pool) recordLatency(duration time.Duration) {
 func (p *Pool) execute(task func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			atomic.AddUint64(&p.metrics.fallbackFailed, 1) // Track panic
+			atomic.AddUint64(&p.metrics.failed, 1)
 			if p.config.PanicHandler != nil {
 				p.config.PanicHandler(r)
 			} else {
 				// Default: capture stack trace silently
 				stackTrace := debug.Stack()
-				// Create a wrapped PoolError with stack trace
-				err := PoolError{msg: "Error running task in submission goroutine", err: fmt.Errorf("%v\n%s", r, stackTrace)}
+				err := PoolError{msg: "Error running task in fallback goroutine", err: fmt.Errorf("%v\n%s", r, stackTrace)}
 				fmt.Printf("[flock error] %v\n", err)
 			}
 		}
 
-		p.submitWg.Done()
 		atomic.AddUint64(&p.metrics.completed, 1)
+		p.submitWg.Done()
 	}()
 
 	// Execute the task

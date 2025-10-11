@@ -88,6 +88,12 @@ func (w *worker) run() {
 	}
 
 	for {
+		// Check shutdown
+		state := w.pool.state.Load().(PoolState)
+		if state == poolStateStopped {
+			break
+		}
+
 		// Find and execute task
 		task := w.findTask()
 
@@ -237,14 +243,14 @@ func (w *worker) executeTask(task func()) {
 	task()
 }
 
-// drainQueue processes remaining tasks during shutdown
+// drainQueue drains remaining tasks during shutdown
 func (w *worker) drainQueue() {
 	for {
 		task := w.queue.pop()
 		if task == nil {
 			break
 		}
-		w.executeTask(task)
+		atomic.AddUint64(&w.pool.metrics.dropped, 1)
 	}
 }
 
