@@ -44,7 +44,6 @@ type Pool struct {
 type poolMetrics struct {
 	submitted uint64 // atomic
 	completed uint64 // atomic
-	failed    uint64 // atomic
 	dropped   uint64 // atomic
 	fallback  uint64 // atomic
 }
@@ -325,7 +324,6 @@ func (p *Pool) recordLatency(duration time.Duration) {
 func (p *Pool) execute(task func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			atomic.AddUint64(&p.metrics.failed, 1)
 			if p.config.PanicHandler != nil {
 				p.config.PanicHandler(r)
 			} else {
