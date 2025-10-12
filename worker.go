@@ -251,6 +251,7 @@ func (w *worker) drainQueue() {
 			break
 		}
 		atomic.AddUint64(&w.pool.metrics.dropped, 1)
+		w.pool.submitWg.Done()
 	}
 }
 

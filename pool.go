@@ -23,9 +23,10 @@ type Pool struct {
 	workers []*worker
 
 	// Lifecycle management
-	state    atomic.Value // PoolState
-	wg       sync.WaitGroup
-	submitWg sync.WaitGroup
+	state      atomic.Value // PoolState
+	wg         sync.WaitGroup
+	submitWg   sync.WaitGroup
+	fallbackWg sync.WaitGroup
 
 	// worker id for round-robin distribution of tasks
 	nextWorkerId uint64
@@ -124,7 +125,16 @@ func (p *Pool) Submit(task func()) error {
 
 	// Fallback: execute in new goroutine
 	atomic.AddUint64(&p.metrics.fallback, 1)
+	p.fallbackWg.Add(1)
 	go func() {
+		defer p.fallbackWg.Done()
+
+		if p.state.Load().(PoolState) != poolStateRunning {
+			atomic.AddUint64(&p.metrics.dropped, 1)
+			p.submitWg.Done()
+			return
+		}
+
 		startTime := time.Now()
 		p.execute(task)
 		p.recordLatency(time.Since(startTime))
@@ -170,6 +180,10 @@ func (p *Pool) Shutdown(graceful bool) {
 		}
 		// Wait for workers to drain queues
 		p.wg.Wait()
+		// Wait for fallback goroutines to exit
+		p.fallbackWg.Wait()
+
+		p.state.Store(poolStateStopped)
 	} else {
 		currentState := p.state.Load().(PoolState)
 		if currentState == poolStateStopped {
@@ -184,9 +198,9 @@ func (p *Pool) Shutdown(graceful bool) {
 
 		// Wait for workers to exit
 		p.wg.Wait()
+		// Wait for fallback goroutines to exit
+		p.fallbackWg.Wait()
 	}
-
-	p.state.Store(poolStateStopped)
 }
 
 // Wait blocks until all submitted tasks have completed.
