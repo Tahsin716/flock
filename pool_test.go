@@ -484,3 +484,395 @@ func TestPool_Stats_WorkerStats(t *testing.T) {
 		t.Errorf("Expected 30 total executions, got %d", totalExecuted)
 	}
 }
+
+// ============================================================================
+// Worker Lifecycle Tests
+// ============================================================================
+
+func TestPool_WorkerHooks(t *testing.T) {
+	var startedWorkers atomic.Int32
+	var stoppedWorkers atomic.Int32
+
+	pool, err := NewPool(
+		WithNumWorkers(2),
+		WithWorkerHooks(
+			func(workerID int) {
+				startedWorkers.Add(1)
+			},
+			func(workerID int) {
+				stoppedWorkers.Add(1)
+			},
+		),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+
+	// Give workers time to start
+	time.Sleep(10 * time.Millisecond)
+
+	if startedWorkers.Load() != 2 {
+		t.Errorf("Expected 2 workers started, got %d", startedWorkers.Load())
+	}
+
+	pool.Shutdown(false)
+
+	if stoppedWorkers.Load() != 2 {
+		t.Errorf("Expected 2 workers stopped, got %d", stoppedWorkers.Load())
+	}
+}
+
+// ============================================================================
+// Concurrency and Race Tests
+// ============================================================================
+
+func TestPool_HighConcurrency(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(8))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	const numGoroutines = 100
+	const tasksPerGoroutine = 100
+	var completed atomic.Int32
+
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerGoroutine; j++ {
+				pool.Submit(func() {
+					completed.Add(1)
+					time.Sleep(time.Microsecond)
+				})
+			}
+		}()
+	}
+
+	wg.Wait()
+	pool.Wait()
+
+	expected := int32(numGoroutines * tasksPerGoroutine)
+	if completed.Load() != expected {
+		t.Errorf("Expected %d completions, got %d", expected, completed.Load())
+	}
+}
+
+// ============================================================================
+// Edge Cases and Stress Tests
+// ============================================================================
+
+func TestPool_EmptyTaskBurst(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(2))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	// Submit many fast tasks
+	for i := 0; i < 10000; i++ {
+		pool.Submit(func() {
+			// No-op
+		})
+	}
+
+	pool.Wait()
+
+	stats := pool.Stats()
+	if stats.Completed != 10000 {
+		t.Errorf("Expected 10000 completed, got %d", stats.Completed)
+	}
+}
+
+func TestPool_LongRunningTasks(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(2))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	var completed atomic.Int32
+	for i := 0; i < 4; i++ {
+		pool.Submit(func() {
+			time.Sleep(50 * time.Millisecond)
+			completed.Add(1)
+		})
+	}
+
+	pool.Wait()
+
+	if completed.Load() != 4 {
+		t.Errorf("Expected 4 completions, got %d", completed.Load())
+	}
+}
+
+func TestPool_RapidSubmitWait(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(4))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	for round := 0; round < 10; round++ {
+		var completed atomic.Int32
+		for i := 0; i < 20; i++ {
+			pool.Submit(func() {
+				completed.Add(1)
+			})
+		}
+		pool.Wait()
+
+		if completed.Load() != 20 {
+			t.Errorf("Round %d: Expected 20 completions, got %d", round, completed.Load())
+		}
+	}
+}
+
+func TestPool_QueueUtilization(t *testing.T) {
+	pool, err := NewPool(
+		WithNumWorkers(2),
+		WithQueueSizePerWorker(64),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	blockChan := make(chan struct{})
+
+	// Fill queues
+	for i := 0; i < 100; i++ {
+		pool.Submit(func() {
+			<-blockChan
+		})
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	stats := pool.Stats()
+	if stats.Utilization <= 0 {
+		t.Error("Expected non-zero utilization")
+	}
+	if stats.TotalQueueDepth <= 0 {
+		t.Error("Expected non-zero queue depth")
+	}
+
+	close(blockChan)
+	pool.Wait()
+}
+
+// ============================================================================
+// Worker Panic Tests
+// ============================================================================
+
+func TestWorker_MultiplePanics(t *testing.T) {
+	var panicCount atomic.Int32
+	pool, err := NewPool(
+		WithNumWorkers(2),
+		WithPanicHandler(func(r interface{}) {
+			panicCount.Add(1)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	for i := 0; i < 10; i++ {
+		pool.Submit(func() {
+			panic("intentional panic")
+		})
+	}
+
+	pool.Wait()
+
+	if panicCount.Load() != 10 {
+		t.Errorf("Expected 10 panics handled, got %d", panicCount.Load())
+	}
+
+	// Pool should still work
+	var executed atomic.Bool
+	pool.Submit(func() {
+		executed.Store(true)
+	})
+	pool.Wait()
+
+	if !executed.Load() {
+		t.Error("Pool should work after panics")
+	}
+}
+
+// ============================================================================
+// Worker Parking and Signaling Tests
+// ============================================================================
+
+func TestWorker_ParkAndWakeup(b *testing.T) {
+	pool, err := NewPool(
+		WithNumWorkers(1),
+		WithMaxParkTime(20*time.Millisecond),
+	)
+	if err != nil {
+		b.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	// Let worker park
+	time.Sleep(50 * time.Millisecond)
+
+	// Submit work - should wake worker
+	var executed atomic.Bool
+	pool.Submit(func() {
+		executed.Store(true)
+	})
+
+	pool.Wait()
+
+	if !executed.Load() {
+		b.Error("Worker did not wake up and execute task")
+	}
+}
+
+func TestWorker_SpinBeforePark(t *testing.T) {
+	pool, err := NewPool(
+		WithNumWorkers(1),
+		WithSpinCount(100),
+		WithMaxParkTime(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	// Submit task after short delay
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		pool.Submit(func() {})
+	}()
+
+	// Worker should spin and find the task before parking
+	time.Sleep(20 * time.Millisecond)
+	pool.Wait()
+
+	stats := pool.Stats()
+	if stats.Completed != 1 {
+		t.Errorf("Expected 1 completion, got %d", stats.Completed)
+	}
+}
+
+// ============================================================================
+// Integration Tests
+// ============================================================================
+
+func TestPool_RealWorldScenario(t *testing.T) {
+	// Simulate a real-world scenario with mixed workloads
+	pool, err := NewPool(
+		WithNumWorkers(4),
+		WithQueueSizePerWorker(128),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(true)
+
+	var (
+		fastTasks   atomic.Int32
+		mediumTasks atomic.Int32
+		slowTasks   atomic.Int32
+		failedTasks atomic.Int32
+	)
+
+	// Fast tasks
+	for i := 0; i < 100; i++ {
+		pool.Submit(func() {
+			fastTasks.Add(1)
+		})
+	}
+
+	// Medium tasks
+	for i := 0; i < 50; i++ {
+		pool.Submit(func() {
+			time.Sleep(time.Millisecond)
+			mediumTasks.Add(1)
+		})
+	}
+
+	// Slow tasks
+	for i := 0; i < 10; i++ {
+		pool.Submit(func() {
+			time.Sleep(10 * time.Millisecond)
+			slowTasks.Add(1)
+		})
+	}
+
+	// Some failing tasks
+	for i := 0; i < 5; i++ {
+		pool.Submit(func() {
+			defer func() {
+				if recover() != nil {
+					failedTasks.Add(1)
+				}
+			}()
+			panic("simulated failure")
+		})
+	}
+
+	pool.Wait()
+
+	if fastTasks.Load() != 100 {
+		t.Errorf("Expected 100 fast tasks, got %d", fastTasks.Load())
+	}
+	if mediumTasks.Load() != 50 {
+		t.Errorf("Expected 50 medium tasks, got %d", mediumTasks.Load())
+	}
+	if slowTasks.Load() != 10 {
+		t.Errorf("Expected 10 slow tasks, got %d", slowTasks.Load())
+	}
+
+	stats := pool.Stats()
+	if stats.Completed != 165 {
+		t.Errorf("Expected 165 total completions, got %d", stats.Completed)
+	}
+}
+
+func TestPool_GracefulDegradation(t *testing.T) {
+	// Test pool behavior under stress
+	pool, err := NewPool(
+		WithNumWorkers(2),
+		WithQueueSizePerWorker(8),
+	)
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	var (
+		submitted atomic.Int32
+		completed atomic.Int32
+	)
+
+	// Rapid fire submissions
+	for i := 0; i < 1000; i++ {
+		err := pool.Submit(func() {
+			completed.Add(1)
+		})
+		if err == nil {
+			submitted.Add(1)
+		}
+	}
+
+	pool.Wait()
+
+	// All submitted tasks should complete (including fallback)
+	if submitted.Load() != completed.Load() {
+		t.Errorf("Submitted %d but completed %d", submitted.Load(), completed.Load())
+	}
+
+	stats := pool.Stats()
+	if stats.FallbackExecuted == 0 {
+		t.Log("No fallback executions (queues handled everything)")
+	} else {
+		t.Logf("Fallback executions: %d", stats.FallbackExecuted)
+	}
+}
