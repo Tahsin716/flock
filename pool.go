@@ -45,6 +45,7 @@ type poolMetrics struct {
 	submitted uint64 // atomic
 	completed uint64 // atomic
 	dropped   uint64 // atomic
+	rejected  uint64 // atomic
 	fallback  uint64 // atomic
 }
 
@@ -119,7 +120,14 @@ func (p *Pool) Submit(task func()) error {
 	atomic.AddUint64(&p.metrics.submitted, 1)
 
 	if err := p.tryFastSubmit(task); err != nil {
+		// Task was not accepted - clean up
 		p.submitWg.Done()
+
+		// Only count as rejected if it was due to full queue, not shutdown
+		if err == ErrQueueFull {
+			atomic.AddUint64(&p.metrics.rejected, 1)
+		}
+
 		return err
 	}
 
@@ -249,8 +257,9 @@ func (p *Pool) Stats() Stats {
 	submitted := atomic.LoadUint64(&p.metrics.submitted)
 	completed := atomic.LoadUint64(&p.metrics.completed)
 	dropped := atomic.LoadUint64(&p.metrics.dropped)
+	rejected := atomic.LoadUint64(&p.metrics.rejected)
 	fallback := atomic.LoadUint64(&p.metrics.fallback)
-	inFlight := submitted - completed - dropped
+	inFlight := submitted - completed - dropped - rejected
 
 	workerStats := make([]WorkerStats, len(p.workers))
 	totalDepth := int64(0)
@@ -291,6 +300,7 @@ func (p *Pool) Stats() Stats {
 		Submitted:          submitted,
 		Completed:          completed,
 		Dropped:            dropped,
+		Rejected:           rejected,
 		FallbackExecuted:   fallback,
 		InFlight:           inFlight,
 		Utilization:        utilization,

@@ -10,6 +10,8 @@ type Stats struct {
 	Completed uint64
 	// Dropped is the total number of tasks dropped by workers during Shutdown (not graceful).
 	Dropped uint64
+	// Rejected is the total number of tasks rejected by workers due to queue being full.
+	Rejected uint64
 	// FallbackExecuted is the total number of tasks executed in the new goroutine due queue being full.
 	FallbackExecuted uint64
 	// InFlight is the estimated number of tasks currently running or in queue.

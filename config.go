@@ -107,7 +107,7 @@ func (c *Config) validate() error {
 		return errInvalidConfig("SpinCount too large (>10000), will waste CPU")
 	}
 
-	if c.BlockingStrategy < 0 && c.BlockingStrategy > 2 {
+	if c.BlockingStrategy < 0 || c.BlockingStrategy > 2 {
 		return errInvalidConfig("BlockingStrategy provided is invalid")
 	}
 
