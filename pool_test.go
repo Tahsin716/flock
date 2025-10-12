@@ -347,3 +347,140 @@ func TestPool_Shutdown_Multiple(t *testing.T) {
 		t.Error("Pool should be shutdown")
 	}
 }
+
+// ============================================================================
+// Wait Tests
+// ============================================================================
+
+func TestPool_Wait_AllTasksComplete(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(4))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	const numTasks = 100
+	var completed atomic.Int32
+
+	for i := 0; i < numTasks; i++ {
+		pool.Submit(func() {
+			time.Sleep(time.Millisecond)
+			completed.Add(1)
+		})
+	}
+
+	pool.Wait()
+
+	if completed.Load() != numTasks {
+		t.Errorf("Expected %d completions, got %d", numTasks, completed.Load())
+	}
+}
+
+func TestPool_Wait_NoTasks(t *testing.T) {
+	pool, err := NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	// Wait should return immediately
+	done := make(chan struct{})
+	go func() {
+		pool.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Wait() did not return")
+	}
+}
+
+// ============================================================================
+// Stats Tests
+// ============================================================================
+
+func TestPool_Stats_Accuracy(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(2))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	const numTasks = 50
+	for i := 0; i < numTasks; i++ {
+		pool.Submit(func() {
+			time.Sleep(time.Millisecond)
+		})
+	}
+
+	pool.Wait()
+
+	stats := pool.Stats()
+	if stats.Submitted != numTasks {
+		t.Errorf("Expected %d submitted, got %d", numTasks, stats.Submitted)
+	}
+	if stats.Completed != numTasks {
+		t.Errorf("Expected %d completed, got %d", numTasks, stats.Completed)
+	}
+	if stats.InFlight != 0 {
+		t.Errorf("Expected 0 in-flight, got %d", stats.InFlight)
+	}
+}
+
+func TestPool_Stats_LatencyTracking(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(2))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	const sleepTime = 10 * time.Millisecond
+	for i := 0; i < 10; i++ {
+		pool.Submit(func() {
+			time.Sleep(sleepTime)
+		})
+	}
+
+	pool.Wait()
+
+	stats := pool.Stats()
+	if stats.LatencyAvg < sleepTime {
+		t.Errorf("Expected avg latency >= %v, got %v", sleepTime, stats.LatencyAvg)
+	}
+	if stats.LatencyMax < sleepTime {
+		t.Errorf("Expected max latency >= %v, got %v", sleepTime, stats.LatencyMax)
+	}
+}
+
+func TestPool_Stats_WorkerStats(t *testing.T) {
+	pool, err := NewPool(WithNumWorkers(3))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	for i := 0; i < 30; i++ {
+		pool.Submit(func() {
+			time.Sleep(time.Millisecond)
+		})
+	}
+
+	pool.Wait()
+
+	stats := pool.Stats()
+	if len(stats.WorkerStats) != 3 {
+		t.Errorf("Expected 3 worker stats, got %d", len(stats.WorkerStats))
+	}
+
+	totalExecuted := uint64(0)
+	for _, ws := range stats.WorkerStats {
+		totalExecuted += ws.TasksExecuted
+	}
+
+	if totalExecuted != 30 {
+		t.Errorf("Expected 30 total executions, got %d", totalExecuted)
+	}
+}
