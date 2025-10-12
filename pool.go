@@ -118,49 +118,70 @@ func (p *Pool) Submit(task func()) error {
 	p.submitWg.Add(1)
 	atomic.AddUint64(&p.metrics.submitted, 1)
 
-	if p.tryFastSubmit(task) {
-		return nil
+	if err := p.tryFastSubmit(task); err != nil {
+		p.submitWg.Done()
+		return err
 	}
-
-	// Fallback: execute in new goroutine
-	atomic.AddUint64(&p.metrics.fallback, 1)
-	p.fallbackWg.Add(1)
-	go func() {
-		defer p.fallbackWg.Done()
-
-		if p.state.Load().(PoolState) != poolStateRunning {
-			atomic.AddUint64(&p.metrics.dropped, 1)
-			p.submitWg.Done()
-			return
-		}
-
-		startTime := time.Now()
-		p.execute(task)
-		p.recordLatency(time.Since(startTime))
-	}()
 
 	return nil
 }
 
 // tryFastSubmit attempts to submit to worker queues via MPSC
-func (p *Pool) tryFastSubmit(task func()) bool {
+func (p *Pool) tryFastSubmit(task func()) error {
 	numWorkers := len(p.workers)
 
 	// Round-robin start index
 	next := atomic.AddUint64(&p.nextWorkerId, 1)
 	startIdx := int(next % uint64(numWorkers))
 
-	for i := 0; i < numWorkers; i++ {
-		idx := (startIdx + i) % numWorkers
-		wk := p.workers[idx]
+	switch p.config.BlockingStrategy {
+	case BlockWhenQueueFull:
+		// While the pool is still running and the queue is full, block it
+		for p.state.Load().(PoolState) == poolStateRunning {
+			for i := 0; i < numWorkers; i++ {
+				idx := (startIdx + i) % numWorkers
+				wk := p.workers[idx]
 
-		if wk.queue.tryPush(task) {
-			wk.signal()
-			return true
+				if wk.queue.tryPush(task) {
+					wk.signal()
+					return nil
+				}
+			}
 		}
+		return ErrPoolShutdown
+	case ErrorWhenQueueFull:
+		// Queue Full so return error
+		for i := 0; i < numWorkers; i++ {
+			idx := (startIdx + i) % numWorkers
+			wk := p.workers[idx]
+
+			if wk.queue.tryPush(task) {
+				wk.signal()
+				return nil
+			}
+		}
+		return ErrQueueFull
+	case NewThreadWhenQueueFull:
+		// Fallback: execute in new goroutine
+		atomic.AddUint64(&p.metrics.fallback, 1)
+		p.fallbackWg.Add(1)
+		go func() {
+			defer p.fallbackWg.Done()
+
+			if p.state.Load().(PoolState) != poolStateRunning {
+				atomic.AddUint64(&p.metrics.dropped, 1)
+				p.submitWg.Done()
+				return
+			}
+
+			startTime := time.Now()
+			p.execute(task)
+			p.recordLatency(time.Since(startTime))
+		}()
+		return nil
 	}
 
-	return false
+	return nil
 }
 
 // Shutdown stops the pool. If graceful is true, it waits for all queued tasks

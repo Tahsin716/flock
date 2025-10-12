@@ -125,6 +125,8 @@ func (w *worker) run() {
 	if w.pool.config.OnWorkerStop != nil {
 		w.pool.config.OnWorkerStop(w.id)
 	}
+
+	w.state.Store(StateShutdown)
 }
 
 // findTask attempts to find a task using priority-based search

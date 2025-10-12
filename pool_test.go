@@ -162,6 +162,7 @@ func TestPool_Submit_FallbackExecution(t *testing.T) {
 	pool, _ := NewPool(
 		WithNumWorkers(1),
 		WithQueueSizePerWorker(2),
+		WithBlockingStrategy(NewThreadWhenQueueFull),
 	)
 	defer pool.Shutdown(false)
 
@@ -806,6 +807,28 @@ func TestPool_EmptyTaskBurst(t *testing.T) {
 	}
 }
 
+func TestPool_TaskBurst(t *testing.T) {
+	pool, err := NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer pool.Shutdown(false)
+
+	// Submit many small tasks
+	for i := 0; i < 10000; i++ {
+		pool.Submit(func() {
+			time.Sleep(5 * time.Millisecond)
+		})
+	}
+
+	pool.Wait()
+
+	stats := pool.Stats()
+	if stats.Completed != 10000 {
+		t.Errorf("Expected 10000 completed, got %d", stats.Completed)
+	}
+}
+
 func TestPool_LongRunningTasks(t *testing.T) {
 	pool, err := NewPool(WithNumWorkers(2))
 	if err != nil {
@@ -905,6 +928,7 @@ func TestPool_EdgeCase_TinyQueue(t *testing.T) {
 	pool, _ := NewPool(
 		WithNumWorkers(2),
 		WithQueueSizePerWorker(2),
+		WithBlockingStrategy(NewThreadWhenQueueFull),
 	)
 	defer pool.Shutdown(false)
 
@@ -1151,6 +1175,7 @@ func TestPool_FallbackExecution_SmallQueue(t *testing.T) {
 	pool, _ := NewPool(
 		WithNumWorkers(1),
 		WithQueueSizePerWorker(4),
+		WithBlockingStrategy(NewThreadWhenQueueFull),
 	)
 	defer pool.Shutdown(false)
 
@@ -1186,6 +1211,7 @@ func TestPool_FallbackExecution_AllQueuesFullnpm(t *testing.T) {
 	pool, _ := NewPool(
 		WithNumWorkers(2),
 		WithQueueSizePerWorker(2),
+		WithBlockingStrategy(NewThreadWhenQueueFull),
 	)
 	defer pool.Shutdown(false)
 

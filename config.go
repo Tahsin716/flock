@@ -44,7 +44,17 @@ type Config struct {
 	// Lower values: worse latency, lower CPU usage
 	// Default: 30 iterations (~1-10µs on modern CPUs)
 	SpinCount int
+
+	BlockingStrategy BlockingStrategy
 }
+
+type BlockingStrategy int32
+
+const (
+	BlockWhenQueueFull BlockingStrategy = iota
+	ErrorWhenQueueFull
+	NewThreadWhenQueueFull
+)
 
 // defaultConfig returns a Config with production-ready defaults
 func defaultConfig() Config {
@@ -55,6 +65,7 @@ func defaultConfig() Config {
 		MaxParkTime:        10 * time.Millisecond,
 		SpinCount:          30,
 		PinWorkerThreads:   false,
+		BlockingStrategy:   BlockWhenQueueFull,
 	}
 }
 
@@ -94,6 +105,10 @@ func (c *Config) validate() error {
 
 	if c.SpinCount > 10000 {
 		return errInvalidConfig("SpinCount too large (>10000), will waste CPU")
+	}
+
+	if c.BlockingStrategy < 0 && c.BlockingStrategy > 2 {
+		return errInvalidConfig("BlockingStrategy provided is invalid")
 	}
 
 	return nil
@@ -142,4 +157,8 @@ func WithMaxParkTime(d time.Duration) Option {
 // WithSpinCount sets how many spins before parking.
 func WithSpinCount(n int) Option {
 	return func(c *Config) { c.SpinCount = n }
+}
+
+func WithBlockingStrategy(b BlockingStrategy) Option {
+	return func(c *Config) { c.BlockingStrategy = b }
 }
