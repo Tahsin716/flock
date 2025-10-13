@@ -1556,3 +1556,40 @@ func TestPool_GracefulDegradation(t *testing.T) {
 		t.Logf("Fallback executions: %d", stats.FallbackExecuted)
 	}
 }
+
+// ============================================================================
+// Load Tests
+// ============================================================================
+
+func TestLoad_SustainedThroughput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping load test in short mode")
+	}
+
+	pool, err := NewPool()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Shutdown(true)
+
+	duration := 10 * time.Second
+	var completed uint64
+	stopTime := time.Now().Add(duration)
+
+	// Sustained submission
+	for time.Now().Before(stopTime) {
+		pool.Submit(func() {
+			atomic.AddUint64(&completed, 1)
+		})
+	}
+
+	pool.Wait()
+
+	throughput := float64(completed) / duration.Seconds()
+	t.Logf("Sustained throughput: %.2f tasks/sec (%d total)", throughput, completed)
+
+	if completed == 0 {
+		t.Error("No tasks completed")
+	}
+}
