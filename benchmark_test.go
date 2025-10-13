@@ -332,12 +332,12 @@ func BenchmarkLatency_BusyPool(b *testing.B) {
 // ============================================================================
 
 func BenchmarkComparison_Pool_1000Tasks(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		pool, _ := NewPool(
-			WithNumWorkers(runtime.NumCPU()),
-			WithQueueSizePerWorker(256),
-		)
+	pool, _ := NewPool(
+		WithNumWorkers(16),
+		WithQueueSizePerWorker(256),
+	)
 
+	for i := 0; i < b.N; i++ {
 		for j := 0; j < 1000; j++ {
 			pool.Submit(func() {
 				time.Sleep(time.Microsecond)
@@ -345,7 +345,7 @@ func BenchmarkComparison_Pool_1000Tasks(b *testing.B) {
 		}
 
 		pool.Wait()
-		pool.Shutdown(false)
+		defer pool.Shutdown(false)
 	}
 }
 
@@ -366,12 +366,12 @@ func BenchmarkComparison_Goroutines_1000Tasks(b *testing.B) {
 }
 
 func BenchmarkComparison_Pool_10000Tasks(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		pool, _ := NewPool(
-			WithNumWorkers(runtime.NumCPU()),
-			WithQueueSizePerWorker(1024),
-		)
+	pool, _ := NewPool(
+		WithNumWorkers(16),
+		WithQueueSizePerWorker(512),
+	)
 
+	for i := 0; i < b.N; i++ {
 		for j := 0; j < 10000; j++ {
 			pool.Submit(func() {
 				time.Sleep(time.Microsecond)
@@ -379,7 +379,7 @@ func BenchmarkComparison_Pool_10000Tasks(b *testing.B) {
 		}
 
 		pool.Wait()
-		pool.Shutdown(false)
+		defer pool.Shutdown(false)
 	}
 }
 
@@ -400,12 +400,12 @@ func BenchmarkComparison_Goroutines_10000Tasks(b *testing.B) {
 }
 
 func BenchmarkAdvanced_Pool_100kTasks(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		pool, _ := NewPool(
-			WithNumWorkers(runtime.NumCPU()),
-			WithQueueSizePerWorker(2048),
-		)
+	pool, _ := NewPool(
+		WithNumWorkers(16),
+		WithQueueSizePerWorker(2048),
+	)
 
+	for i := 0; i < b.N; i++ {
 		var completed uint64
 		for j := 0; j < 100000; j++ {
 			pool.Submit(func() {
@@ -414,7 +414,7 @@ func BenchmarkAdvanced_Pool_100kTasks(b *testing.B) {
 		}
 
 		pool.Wait()
-		pool.Shutdown(false)
+		defer pool.Shutdown(false)
 
 		if completed != 100000 {
 			b.Errorf("Expected 100000, got %d", completed)
@@ -513,7 +513,7 @@ func BenchmarkComparison_Goroutines_MemoryAlloc(b *testing.B) {
 
 func BenchmarkAdvanced_Pool_MixedLoad(b *testing.B) {
 	pool, _ := NewPool(
-		WithNumWorkers(runtime.NumCPU()),
+		WithNumWorkers(16),
 		WithQueueSizePerWorker(1024),
 	)
 	defer pool.Shutdown(true)
@@ -642,4 +642,132 @@ func BenchmarkMemory_Goroutines_GCPressure(b *testing.B) {
 		}()
 	}
 	wg.Wait()
+}
+
+// ============================================================================
+// Contention Benchmarks
+// ============================================================================
+
+func BenchmarkContention_Pool_HighSubmitters(b *testing.B) {
+	pool, _ := NewPool(WithNumWorkers(16))
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	b.SetParallelism(100) // Many submitters
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			pool.Submit(func() {
+				time.Sleep(time.Microsecond)
+			})
+		}
+	})
+	pool.Wait()
+}
+
+func BenchmarkContention_Goroutines_HighSubmitters(b *testing.B) {
+	var wg sync.WaitGroup
+
+	b.ResetTimer()
+	b.SetParallelism(100) // Many submitters
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(time.Microsecond)
+			}()
+		}
+	})
+	wg.Wait()
+}
+
+// ============================================================================
+// Parking and Spinning Benchmarks
+// ============================================================================
+
+func BenchmarkParking_NoSpin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(256),
+		WithSpinCount(0),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {})
+	}
+	pool.Wait()
+}
+
+func BenchmarkParking_Spin10(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(256),
+		WithSpinCount(10),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {})
+	}
+	pool.Wait()
+}
+
+func BenchmarkParking_Spin100(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(256),
+		WithSpinCount(100),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {})
+	}
+	pool.Wait()
+}
+
+// ============================================================================
+// Shutdown Performance
+// ============================================================================
+
+func BenchmarkShutdown_Graceful_Empty(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		pool, _ := NewPool(
+			WithNumWorkers(4),
+			WithQueueSizePerWorker(256),
+		)
+		pool.Shutdown(true)
+	}
+}
+
+func BenchmarkShutdown_Immediate_Empty(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		pool, _ := NewPool(
+			WithNumWorkers(4),
+			WithQueueSizePerWorker(256),
+		)
+		pool.Shutdown(false)
+	}
+}
+
+func BenchmarkShutdown_Graceful_WithTasks(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		pool, _ := NewPool(
+			WithNumWorkers(4),
+			WithQueueSizePerWorker(256),
+		)
+
+		// Submit some tasks
+		for j := 0; j < 100; j++ {
+			pool.Submit(func() {
+				time.Sleep(time.Microsecond)
+			})
+		}
+
+		pool.Shutdown(true)
+	}
 }
