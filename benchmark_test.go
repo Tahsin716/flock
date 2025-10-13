@@ -3,6 +3,7 @@ package flock
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -247,6 +248,86 @@ func BenchmarkThroughput_100us(b *testing.B) {
 }
 
 // ============================================================================
+// Latency Benchmarks
+// ============================================================================
+
+func BenchmarkLatency_SubmitToExecution(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	var totalLatency int64
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		done := make(chan struct{})
+
+		pool.Submit(func() {
+			latency := time.Since(start)
+			atomic.AddInt64(&totalLatency, int64(latency))
+			close(done)
+		})
+
+		<-done
+	}
+
+	avgLatency := time.Duration(atomic.LoadInt64(&totalLatency) / int64(b.N))
+	b.ReportMetric(float64(avgLatency.Microseconds()), "µs/op")
+}
+
+func BenchmarkLatency_EmptyPool(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		done := make(chan struct{})
+		start := time.Now()
+
+		pool.Submit(func() {
+			close(done)
+		})
+
+		<-done
+		_ = time.Since(start)
+	}
+}
+
+func BenchmarkLatency_BusyPool(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	// Pre-load pool with work
+	for i := 0; i < 100; i++ {
+		pool.Submit(func() {
+			time.Sleep(10 * time.Millisecond)
+		})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		done := make(chan struct{})
+		start := time.Now()
+
+		pool.Submit(func() {
+			close(done)
+		})
+
+		<-done
+		_ = time.Since(start)
+	}
+}
+
+// ============================================================================
 // Comparison: Pool vs Raw Goroutines
 // ============================================================================
 
@@ -318,6 +399,50 @@ func BenchmarkComparison_Goroutines_10000Tasks(b *testing.B) {
 	}
 }
 
+func BenchmarkAdvanced_Pool_100kTasks(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		pool, _ := NewPool(
+			WithNumWorkers(runtime.NumCPU()),
+			WithQueueSizePerWorker(2048),
+		)
+
+		var completed uint64
+		for j := 0; j < 100000; j++ {
+			pool.Submit(func() {
+				atomic.AddUint64(&completed, 1)
+			})
+		}
+
+		pool.Wait()
+		pool.Shutdown(false)
+
+		if completed != 100000 {
+			b.Errorf("Expected 100000, got %d", completed)
+		}
+	}
+}
+
+func BenchmarkAdvanced_Goroutines_100kTasks(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		var wg sync.WaitGroup
+		var completed uint64
+
+		wg.Add(100000)
+		for j := 0; j < 100000; j++ {
+			go func() {
+				defer wg.Done()
+				atomic.AddUint64(&completed, 1)
+			}()
+		}
+
+		wg.Wait()
+
+		if completed != 100000 {
+			b.Errorf("Expected 100000, got %d", completed)
+		}
+	}
+}
+
 func BenchmarkComparison_Pool_CPUBound(b *testing.B) {
 	pool, _ := NewPool()
 	defer pool.Shutdown(true)
@@ -383,5 +508,56 @@ func BenchmarkComparison_Goroutines_MemoryAlloc(b *testing.B) {
 			defer wg.Done()
 		}()
 	}
+	wg.Wait()
+}
+
+func BenchmarkAdvanced_Pool_MixedLoad(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			i++
+			if i%10 == 0 {
+				// 10% slow tasks
+				pool.Submit(func() {
+					time.Sleep(100 * time.Microsecond)
+				})
+			} else {
+				// 90% fast tasks
+				pool.Submit(func() {})
+			}
+		}
+	})
+	pool.Wait()
+}
+
+func BenchmarkAdvanced_Goroutines_MixedLoad(b *testing.B) {
+	b.ResetTimer()
+	var wg sync.WaitGroup
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			i++
+			wg.Add(1)
+			if i%10 == 0 {
+				// 10% slow tasks
+				go func() {
+					defer wg.Done()
+					time.Sleep(100 * time.Microsecond)
+				}()
+			} else {
+				// 90% fast tasks
+				go func() {
+					defer wg.Done()
+				}()
+			}
+		}
+	})
 	wg.Wait()
 }
