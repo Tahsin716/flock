@@ -77,6 +77,77 @@ func BenchmarkPool_HighContention(b *testing.B) {
 }
 
 // ============================================================================
+// Scalability Benchmarks
+// ============================================================================
+
+func BenchmarkScalability_Workers1(b *testing.B) {
+	benchmarkWithWorkers(b, 1)
+}
+
+func BenchmarkScalability_Workers2(b *testing.B) {
+	benchmarkWithWorkers(b, 2)
+}
+
+func BenchmarkScalability_Workers4(b *testing.B) {
+	benchmarkWithWorkers(b, 4)
+}
+
+func BenchmarkScalability_Workers8(b *testing.B) {
+	benchmarkWithWorkers(b, 8)
+}
+
+func BenchmarkScalability_Workers16(b *testing.B) {
+	benchmarkWithWorkers(b, 16)
+}
+
+func benchmarkWithWorkers(b *testing.B, numWorkers int) {
+	pool, _ := NewPool(
+		WithNumWorkers(numWorkers),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {})
+	}
+	pool.Wait()
+}
+
+// ============================================================================
+// Queue Size Impact Benchmarks
+// ============================================================================
+
+func BenchmarkQueueSize_64(b *testing.B) {
+	benchmarkWithQueueSize(b, 64)
+}
+
+func BenchmarkQueueSize_256(b *testing.B) {
+	benchmarkWithQueueSize(b, 256)
+}
+
+func BenchmarkQueueSize_1024(b *testing.B) {
+	benchmarkWithQueueSize(b, 1024)
+}
+
+func BenchmarkQueueSize_4096(b *testing.B) {
+	benchmarkWithQueueSize(b, 4096)
+}
+
+func benchmarkWithQueueSize(b *testing.B, queueSize int) {
+	pool, _ := NewPool(
+		WithQueueSizePerWorker(queueSize),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {})
+	}
+	pool.Wait()
+}
+
+// ============================================================================
 // Comparison: Pool vs Raw Goroutines
 // ============================================================================
 

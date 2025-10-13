@@ -1593,3 +1593,42 @@ func TestLoad_SustainedThroughput(t *testing.T) {
 		t.Error("No tasks completed")
 	}
 }
+
+func TestLoad_BurstyTraffic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping load test in short mode")
+	}
+
+	pool, err := NewPool(
+		WithBlockingStrategy(NewThreadWhenQueueFull),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Shutdown(true)
+
+	var completed uint64
+	numTasks := 100000
+	// Simulate bursts
+	for burst := 0; burst < 10; burst++ {
+		// Burst of tasks
+		for i := 0; i < numTasks; i++ {
+			pool.Submit(func() {
+				atomic.AddUint64(&completed, 1)
+			})
+		}
+
+		// Quiet period
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	pool.Wait()
+
+	stats := pool.Stats()
+	t.Logf("Bursty traffic stats: completed=%d, fallback=%d",
+		stats.Completed, stats.FallbackExecuted)
+
+	if completed != 1000000 {
+		t.Errorf("Expected 1000000 completed, got %d", completed)
+	}
+}
