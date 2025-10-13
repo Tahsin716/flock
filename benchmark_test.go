@@ -148,6 +148,105 @@ func benchmarkWithQueueSize(b *testing.B, queueSize int) {
 }
 
 // ============================================================================
+// Blocking Strategy Performance Comparison
+// ============================================================================
+
+func BenchmarkStrategy_Block(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(4),
+		WithQueueSizePerWorker(256),
+		WithBlockingStrategy(BlockWhenQueueFull),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			pool.Submit(func() {
+				time.Sleep(time.Microsecond)
+			})
+		}
+	})
+	pool.Wait()
+}
+
+// ============================================================================
+// Throughput Under Different Task Durations
+// ============================================================================
+
+func BenchmarkThroughput_Instant(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			// Instant task
+		})
+	}
+	pool.Wait()
+
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
+}
+
+func BenchmarkThroughput_1us(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			time.Sleep(time.Microsecond)
+		})
+	}
+	pool.Wait()
+
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
+}
+
+func BenchmarkThroughput_10us(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			time.Sleep(10 * time.Microsecond)
+		})
+	}
+	pool.Wait()
+
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
+}
+
+func BenchmarkThroughput_100us(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			time.Sleep(100 * time.Microsecond)
+		})
+	}
+	pool.Wait()
+
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
+}
+
+// ============================================================================
 // Comparison: Pool vs Raw Goroutines
 // ============================================================================
 
