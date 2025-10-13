@@ -561,3 +561,85 @@ func BenchmarkAdvanced_Goroutines_MixedLoad(b *testing.B) {
 	})
 	wg.Wait()
 }
+
+// ============================================================================
+// Memory Pressure Benchmarks
+// ============================================================================
+
+func BenchmarkMemory_Pool_LargeTasks(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(512),
+	)
+	defer pool.Shutdown(true)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			// Allocate some memory
+			data := make([]byte, 1024)
+			_ = data
+		})
+	}
+	pool.Wait()
+}
+
+func BenchmarkMemory_Goroutines_LargeTasks(b *testing.B) {
+	var wg sync.WaitGroup
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Allocate some memory
+			data := make([]byte, 1024)
+			_ = data
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkMemory_Pool_GCPressure(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			// Create garbage
+			for j := 0; j < 100; j++ {
+				_ = make([]byte, 64)
+			}
+		})
+	}
+	pool.Wait()
+}
+
+func BenchmarkMemory_Goroutines_GCPressure(b *testing.B) {
+	var wg sync.WaitGroup
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Create garbage
+			for j := 0; j < 100; j++ {
+				_ = make([]byte, 64)
+			}
+		}()
+	}
+	wg.Wait()
+}
