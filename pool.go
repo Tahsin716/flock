@@ -2,6 +2,7 @@ package flock
 
 import (
 	"fmt"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,24 @@ const (
 	poolStateStopped
 )
 
-// Pool is a high-performance worker pool
+// metricsShard reduces contention by sharding metrics across cache lines
+type metricsShard struct {
+	_         [56]byte // Padding
+	submitted uint64   // atomic
+	_         [56]byte
+	completed uint64 // atomic
+	_         [56]byte
+	dropped   uint64 // atomic
+	_         [56]byte
+	rejected  uint64 // atomic
+	_         [56]byte
+	fallback  uint64 // atomic
+	_         [56]byte
+}
+
+const numMetricShards = 16
+
+// Pool is a high-performance worker pool with hybrid queue architecture
 type Pool struct {
 	config  Config
 	workers []*worker
@@ -28,11 +46,14 @@ type Pool struct {
 	submitWg   sync.WaitGroup
 	fallbackWg sync.WaitGroup
 
-	// worker id for round-robin distribution of tasks
+	// Worker selection
 	nextWorkerId uint64
 
-	// Metrics
-	metrics poolMetrics
+	// Sharded metrics to reduce contention
+	metricsShards [numMetricShards]metricsShard
+
+	// Hybrid queue: global fallback for high contention
+	globalQueue chan func()
 
 	// Latency tracking
 	latencySum   uint64 // atomic
@@ -40,41 +61,29 @@ type Pool struct {
 	latencyMax   uint64 // atomic
 }
 
-// poolMetrics tracks pool-wide statistics
-type poolMetrics struct {
-	submitted uint64 // atomic
-	completed uint64 // atomic
-	dropped   uint64 // atomic
-	rejected  uint64 // atomic
-	fallback  uint64 // atomic
-}
-
 // NewPool creates a new worker pool with the given options.
-// It returns an error if the configuration is invalid.
-//
-// Example:
-//
-//	pool, err := flock.NewPool(
-//	    flock.WithNumWorkers(4),
-//	    flock.WithQueueSizePerWorker(256),
-//	)
 func NewPool(opts ...Option) (*Pool, error) {
-	// Start with default config
 	cfg := defaultConfig()
 
-	// Apply user options
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
-	// validate final configuration
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 
+	// Global queue size = (total capacity) / 4
+	// This provides a good buffer for contention without excessive memory
+	globalQueueSize := (cfg.NumWorkers * cfg.QueueSizePerWorker) / 4
+	if globalQueueSize < 256 {
+		globalQueueSize = 256 // Minimum size
+	}
+
 	pool := &Pool{
-		config:  cfg,
-		workers: make([]*worker, cfg.NumWorkers),
+		config:      cfg,
+		workers:     make([]*worker, cfg.NumWorkers),
+		globalQueue: make(chan func(), globalQueueSize),
 	}
 	pool.state.Store(poolStateRunning)
 
@@ -94,17 +103,7 @@ func NewPool(opts ...Option) (*Pool, error) {
 	return pool, nil
 }
 
-// Submit submits a task to the pool. It never returns an error for queue full -
-// instead it executes the task in new goroutine if all worker queues are full.
-//
-// Returns ErrNilTask if task is nil.
-// Returns ErrPoolShutdown if the pool has been shut down.
-//
-// Example:
-//
-//	err := pool.Submit(func() {
-//	    fmt.Println("Task executed")
-//	})
+// Submit submits a task to the pool.
 func (p *Pool) Submit(task func()) error {
 	if task == nil {
 		return ErrNilTask
@@ -115,17 +114,18 @@ func (p *Pool) Submit(task func()) error {
 		return ErrPoolShutdown
 	}
 
-	// Add to waitgroup BEFORE incrementing submitted to prevent races
 	p.submitWg.Add(1)
-	atomic.AddUint64(&p.metrics.submitted, 1)
 
-	if err := p.tryFastSubmit(task); err != nil {
-		// Task was not accepted - clean up
+	// Use sharded metrics to reduce contention
+	shardIdx := fastrand() % numMetricShards
+	atomic.AddUint64(&p.metricsShards[shardIdx].submitted, 1)
+
+	if err := p.trySubmit(task); err != nil {
 		p.submitWg.Done()
 
-		// Only count as rejected if it was due to full queue, not shutdown
 		if err == ErrQueueFull {
-			atomic.AddUint64(&p.metrics.rejected, 1)
+			shardIdx := fastrand() % numMetricShards
+			atomic.AddUint64(&p.metricsShards[shardIdx].rejected, 1)
 		}
 
 		return err
@@ -134,56 +134,106 @@ func (p *Pool) Submit(task func()) error {
 	return nil
 }
 
-// tryFastSubmit attempts to submit a task according to the configured blocking strategy.
-func (p *Pool) tryFastSubmit(task func()) error {
+// trySubmit attempts to submit using hybrid approach
+func (p *Pool) trySubmit(task func()) error {
 	numWorkers := len(p.workers)
 
-	// Round-robin start index
+	// Round-robin starting point (still useful for load distribution)
 	next := atomic.AddUint64(&p.nextWorkerId, 1)
 	startIdx := int(next % uint64(numWorkers))
 
-	// try to push the task to queue
-	tryEnqueue := func() bool {
-		for i := 0; i < numWorkers; i++ {
-			idx := (startIdx + i) % numWorkers
-			wk := p.workers[idx]
-
-			if wk.queue.tryPush(task) {
-				wk.signal()
-				return true
-			}
-		}
-		return false
-	}
-
 	switch p.config.BlockingStrategy {
 	case BlockWhenQueueFull:
-		// Keep retrying until success or pool stops
-		for p.state.Load().(PoolState) == poolStateRunning {
-			if tryEnqueue() {
+		return p.submitBlocking(task, startIdx, numWorkers)
+
+	case ErrorWhenQueueFull:
+		return p.submitNonBlocking(task, startIdx, numWorkers)
+
+	case NewThreadWhenQueueFull:
+		return p.submitWithFallback(task, startIdx, numWorkers)
+	}
+
+	return nil
+}
+
+// submitBlocking tries local queues, then global, then blocks
+func (p *Pool) submitBlocking(task func(), startIdx, numWorkers int) error {
+	for p.state.Load().(PoolState) == poolStateRunning {
+		// Phase 1: Try all local worker queues (fast path)
+		for i := 0; i < numWorkers; i++ {
+			idx := (startIdx + i) % numWorkers
+			if p.workers[idx].queue.tryPush(task) {
+				p.workers[idx].signal()
 				return nil
 			}
 		}
-		return ErrPoolShutdown
-	case ErrorWhenQueueFull:
-		// Queue Full so return error
-		if tryEnqueue() {
-			return nil
-		}
-		return ErrQueueFull
-	case NewThreadWhenQueueFull:
-		if tryEnqueue() {
-			return nil
-		}
 
-		// Fallback: execute in new goroutine
-		atomic.AddUint64(&p.metrics.fallback, 1)
+		// Phase 2: Try global queue (contention-optimized path)
+		select {
+		case p.globalQueue <- task:
+			shardIdx := fastrand() % numMetricShards
+			atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+			return nil
+		default:
+			// Global queue also full, yield and retry
+			runtime.Gosched()
+		}
+	}
+
+	return ErrPoolShutdown
+}
+
+// submitNonBlocking tries local queues, then global, then returns error
+func (p *Pool) submitNonBlocking(task func(), startIdx, numWorkers int) error {
+	// Phase 1: Try all local worker queues
+	for i := 0; i < numWorkers; i++ {
+		idx := (startIdx + i) % numWorkers
+		if p.workers[idx].queue.tryPush(task) {
+			p.workers[idx].signal()
+			return nil
+		}
+	}
+
+	// Phase 2: Try global queue
+	select {
+	case p.globalQueue <- task:
+		shardIdx := fastrand() % numMetricShards
+		atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
+
+// submitWithFallback tries local, then global, then spawns goroutine
+func (p *Pool) submitWithFallback(task func(), startIdx, numWorkers int) error {
+	// Phase 1: Try all local worker queues
+	for i := 0; i < numWorkers; i++ {
+		idx := (startIdx + i) % numWorkers
+		if p.workers[idx].queue.tryPush(task) {
+			p.workers[idx].signal()
+			return nil
+		}
+	}
+
+	// Phase 2: Try global queue
+	select {
+	case p.globalQueue <- task:
+		shardIdx := fastrand() % numMetricShards
+		atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+		return nil
+	default:
+		// Phase 3: Spawn new goroutine
+		shardIdx := fastrand() % numMetricShards
+		atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+
 		p.fallbackWg.Add(1)
 		go func() {
 			defer p.fallbackWg.Done()
 
 			if p.state.Load().(PoolState) != poolStateRunning {
-				atomic.AddUint64(&p.metrics.dropped, 1)
+				shardIdx := fastrand() % numMetricShards
+				atomic.AddUint64(&p.metricsShards[shardIdx].dropped, 1)
 				p.submitWg.Done()
 				return
 			}
@@ -194,24 +244,18 @@ func (p *Pool) tryFastSubmit(task func()) error {
 		}()
 		return nil
 	}
-
-	return nil
 }
 
-// Shutdown stops the pool. If graceful is true, it waits for all queued tasks
-// to complete. If false, it stops immediately after current tasks finish.
-//
-// Multiple calls to Shutdown are safe and will be ignored after the first call.
-//
-// Example:
-//
-//	pool.Shutdown(true)  // Wait for all tasks
-//	pool.Shutdown(false) // Stop immediately
+// Shutdown stops the pool
 func (p *Pool) Shutdown(graceful bool) {
 	if graceful {
 		if !p.state.CompareAndSwap(poolStateRunning, poolStateDraining) {
 			return
 		}
+
+		// Close global queue to signal workers
+		close(p.globalQueue)
+
 		// Wait for workers to drain queues
 		p.wg.Wait()
 		// Wait for fallback goroutines to exit
@@ -225,6 +269,9 @@ func (p *Pool) Shutdown(graceful bool) {
 		}
 		p.state.Store(poolStateStopped)
 
+		// Close global queue
+		close(p.globalQueue)
+
 		// Wake up all parked workers
 		for _, wk := range p.workers {
 			wk.signal()
@@ -237,34 +284,23 @@ func (p *Pool) Shutdown(graceful bool) {
 	}
 }
 
-// Wait blocks until all submitted tasks have completed.
-// It does not shut down the pool - the pool remains available for new tasks.
-//
-// Example:
-//
-//	pool.Submit(task1)
-//	pool.Submit(task2)
-//	pool.Wait() // Blocks until task1 and task2 complete
+// Wait blocks until all submitted tasks have completed
 func (p *Pool) Wait() {
 	p.submitWg.Wait()
 }
 
-// Stats returns a snapshot of pool statistics including task counts,
-// latency metrics, and per-worker statistics.
-//
-// Note: Stats are collected without locks, so values may be slightly
-// inconsistent during concurrent operations.
-//
-// Example:
-//
-//	stats := pool.Stats()
-//	fmt.Printf("Completed: %d/%d\n", stats.Completed, stats.Submitted)
+// Stats returns a snapshot of pool statistics
 func (p *Pool) Stats() Stats {
-	submitted := atomic.LoadUint64(&p.metrics.submitted)
-	completed := atomic.LoadUint64(&p.metrics.completed)
-	dropped := atomic.LoadUint64(&p.metrics.dropped)
-	rejected := atomic.LoadUint64(&p.metrics.rejected)
-	fallback := atomic.LoadUint64(&p.metrics.fallback)
+	// Aggregate sharded metrics
+	var submitted, completed, dropped, rejected, fallback uint64
+	for i := 0; i < numMetricShards; i++ {
+		submitted += atomic.LoadUint64(&p.metricsShards[i].submitted)
+		completed += atomic.LoadUint64(&p.metricsShards[i].completed)
+		dropped += atomic.LoadUint64(&p.metricsShards[i].dropped)
+		rejected += atomic.LoadUint64(&p.metricsShards[i].rejected)
+		fallback += atomic.LoadUint64(&p.metricsShards[i].fallback)
+	}
+
 	inFlight := submitted - completed - dropped - rejected
 
 	workerStats := make([]WorkerStats, len(p.workers))
@@ -286,6 +322,12 @@ func (p *Pool) Stats() Stats {
 			State:         wk.getState().string(),
 		}
 	}
+
+	// Add global queue to totals
+	globalQueueLen := len(p.globalQueue)
+	globalQueueCap := cap(p.globalQueue)
+	totalDepth += int64(globalQueueLen)
+	totalCapacity += int64(globalQueueCap)
 
 	utilization := float64(0)
 	if totalCapacity > 0 {
@@ -319,22 +361,12 @@ func (p *Pool) Stats() Stats {
 	}
 }
 
-// IsShutdown returns true if the pool has been shut down.
-//
-// Example:
-//
-//	if pool.IsShutdown() {
-//	    fmt.Println("Pool is no longer accepting tasks")
-//	}
+// IsShutdown returns true if the pool has been shut down
 func (p *Pool) IsShutdown() bool {
 	return p.state.Load().(PoolState) == poolStateStopped
 }
 
-// NumWorkers returns the number of workers in the pool.
-//
-// Example:
-//
-//	fmt.Printf("Pool has %d workers\n", pool.NumWorkers())
+// NumWorkers returns the number of workers in the pool
 func (p *Pool) NumWorkers() int {
 	return len(p.workers)
 }
@@ -364,17 +396,29 @@ func (p *Pool) execute(task func()) {
 			if p.config.PanicHandler != nil {
 				p.config.PanicHandler(r)
 			} else {
-				// Default: capture stack trace silently
 				stackTrace := debug.Stack()
 				err := PoolError{msg: "Error running task in fallback goroutine", err: fmt.Errorf("%v\n%s", r, stackTrace)}
 				fmt.Printf("[flock error] %v\n", err)
 			}
 		}
 
-		atomic.AddUint64(&p.metrics.completed, 1)
+		shardIdx := fastrand() % numMetricShards
+		atomic.AddUint64(&p.metricsShards[shardIdx].completed, 1)
 		p.submitWg.Done()
 	}()
 
-	// Execute the task
 	task()
+}
+
+var rngSeed uint32 = 1
+
+// fastrand provides fast random number generation
+func fastrand() uint32 {
+	// Xorshift RNG - fast and good enough for load distribution
+	seed := atomic.LoadUint32(&rngSeed)
+	seed ^= seed << 13
+	seed ^= seed >> 17
+	seed ^= seed << 5
+	atomic.StoreUint32(&rngSeed, seed)
+	return seed
 }

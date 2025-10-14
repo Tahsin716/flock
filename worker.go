@@ -41,16 +41,16 @@ func (s workerState) string() string {
 	}
 }
 
-// worker represents a single worker goroutine with MPSC queue
+// worker represents a single worker goroutine
 type worker struct {
 	id   int
 	pool *Pool
 
-	// Single MPSC queue for all operations
+	// Single MPSC queue for local tasks
 	queue *lockFreeQueue
 
 	// State management
-	state atomic.Value // WorkerState
+	state atomic.Value // workerState
 
 	// Metrics
 	tasksExecuted uint64 // atomic
@@ -63,7 +63,7 @@ type worker struct {
 	parked    uint32 // atomic: 0 = running, 1 = parked
 }
 
-// newWorker creates a new worker with MPSC queue
+// newWorker creates a new worker
 func newWorker(id int, pool *Pool, queueSize int) *worker {
 	w := &worker{
 		id:         id,
@@ -98,21 +98,21 @@ func (w *worker) run() {
 		task := w.findTask()
 
 		if task == nil {
-			// Check shutdown
+			// Check shutdown again
 			state := w.pool.state.Load().(PoolState)
 			if state == poolStateStopped {
 				break
 			}
 
-			// During draining, exit if queue empty
-			if state == poolStateDraining && w.queue.isEmpty() {
+			// During draining, exit if all queues empty
+			if state == poolStateDraining && w.allQueuesEmpty() {
 				break
 			}
 
 			continue
 		}
 
-		// update last active
+		// Update last active
 		atomic.StoreInt64(&w.lastActive, time.Now().UnixNano())
 
 		// Execute the task
@@ -120,7 +120,7 @@ func (w *worker) run() {
 	}
 
 	// Cleanup: drain remaining tasks
-	w.drainQueue()
+	w.drainQueues()
 
 	if w.pool.config.OnWorkerStop != nil {
 		w.pool.config.OnWorkerStop(w.id)
@@ -131,12 +131,24 @@ func (w *worker) run() {
 
 // findTask attempts to find a task using priority-based search
 func (w *worker) findTask() func() {
-	// Priority 1: Own queue (FIFO - single consumer)
+	// Priority 1: Local queue (FIFO, no contention, fastest)
 	if task := w.queue.pop(); task != nil {
 		return task
 	}
 
-	// Priority 2: Park and wait
+	// Priority 2: Global queue (optimized Go channel, good under contention)
+	select {
+	case task, ok := <-w.pool.globalQueue:
+		if !ok {
+			// Global queue closed (shutdown)
+			return nil
+		}
+		return task
+	default:
+		// Global queue empty, continue to parking
+	}
+
+	// Priority 3: Park and wait
 	return w.parkAndWait()
 }
 
@@ -156,10 +168,23 @@ func (w *worker) spinForWork() func() {
 	w.state.Store(StateSpinning)
 
 	for i := 0; i < w.pool.config.SpinCount; i++ {
+		// Check local queue
 		if task := w.queue.pop(); task != nil {
 			w.state.Store(StateRunning)
 			return task
 		}
+
+		// Check global queue
+		select {
+		case task, ok := <-w.pool.globalQueue:
+			if !ok {
+				return nil // Closed
+			}
+			w.state.Store(StateRunning)
+			return task
+		default:
+		}
+
 		runtime.Gosched()
 	}
 
@@ -171,7 +196,7 @@ func (w *worker) parkWithTimeout() func() {
 	w.parkMutex.Lock()
 	defer w.parkMutex.Unlock()
 
-	// Set parked state AFTER acquiring lock to prevent lost wakeups
+	// Set parked state AFTER acquiring lock
 	w.state.Store(StateParked)
 	atomic.StoreUint32(&w.parked, uint32(parkedState))
 
@@ -181,16 +206,39 @@ func (w *worker) parkWithTimeout() func() {
 		w.state.Store(StateRunning)
 	}()
 
-	// Double-check for work while holding lock (prevents lost wakeup)
+	// Double-check for work while holding lock
 	if task := w.queue.pop(); task != nil {
 		return task
+	}
+
+	// Check global queue
+	select {
+	case task, ok := <-w.pool.globalQueue:
+		if !ok {
+			return nil // Closed
+		}
+		return task
+	default:
 	}
 
 	// Wait for signal or timeout
 	w.waitForSignal()
 
 	// Check for work after waking
-	return w.queue.pop()
+	if task := w.queue.pop(); task != nil {
+		return task
+	}
+
+	// Check global queue
+	select {
+	case task, ok := <-w.pool.globalQueue:
+		if !ok {
+			return nil // Closed
+		}
+		return task
+	default:
+		return nil
+	}
 }
 
 // waitForSignal waits for a signal or timeout using a timer
@@ -225,35 +273,74 @@ func (w *worker) executeTask(task func()) {
 			if w.pool.config.PanicHandler != nil {
 				w.pool.config.PanicHandler(r)
 			} else {
-				// Default: capture stack trace silently
 				stackTrace := debug.Stack()
-				// Create a wrapped PoolError with worker ID and stack trace
 				wrappedErr := errWorker(w.id, fmt.Errorf("%v\n%s", r, stackTrace))
 				fmt.Printf("[flock error] %v\n", wrappedErr)
 			}
 		}
 
-		// Always track metrics even if panic occurred
+		// Always track metrics
 		duration := time.Since(startTime)
 		w.pool.recordLatency(duration)
 		atomic.AddUint64(&w.tasksExecuted, 1)
-		atomic.AddUint64(&w.pool.metrics.completed, 1)
+
+		// Use sharded metrics
+		shardIdx := fastrand() % numMetricShards
+		atomic.AddUint64(&w.pool.metricsShards[shardIdx].completed, 1)
 		w.pool.submitWg.Done()
 	}()
 
-	// Execute the task
 	task()
 }
 
-// drainQueue drains remaining tasks during shutdown
-func (w *worker) drainQueue() {
+// allQueuesEmpty checks if both local and global queues are empty
+func (w *worker) allQueuesEmpty() bool {
+	if !w.queue.isEmpty() {
+		return false
+	}
+
+	// If the global queue is closed and empty, we're done
+	if len(w.pool.globalQueue) == 0 {
+		select {
+		case <-w.pool.globalQueue:
+			// Channel closed and drained completely
+			return true
+		default:
+			return true
+		}
+	}
+
+	return false
+}
+
+func (w *worker) drainQueues() {
+	// Drain local queue
 	for {
 		task := w.queue.pop()
 		if task == nil {
 			break
 		}
-		atomic.AddUint64(&w.pool.metrics.dropped, 1)
+		shardIdx := fastrand() % numMetricShards
+		atomic.AddUint64(&w.pool.metricsShards[shardIdx].dropped, 1)
 		w.pool.submitWg.Done()
+	}
+
+	// Only worker 0 drains the global queue to avoid contention
+	if w.id == 0 {
+		for {
+			select {
+			case _, ok := <-w.pool.globalQueue:
+				if !ok {
+					return // channel closed — done draining
+				}
+				// Always Done() for every task
+				shardIdx := fastrand() % numMetricShards
+				atomic.AddUint64(&w.pool.metricsShards[shardIdx].dropped, 1)
+				w.pool.submitWg.Done()
+			default:
+				return
+			}
+		}
 	}
 }
 

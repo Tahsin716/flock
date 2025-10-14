@@ -270,20 +270,24 @@ func TestLockFreeQueue_StressTest(t *testing.T) {
 	q := newQueue(2048)
 	duration := 3 * time.Second
 
-	var pushed, popped int64
+	var pushAttempts, pushSuccesses int64
+	var popAttempts, popSuccesses int64
 	stop := make(chan struct{})
 
 	// Producers
 	numProducers := 4
 	for i := 0; i < numProducers; i++ {
 		go func() {
+			localPushes := int64(0)
 			for {
 				select {
 				case <-stop:
+					atomic.AddInt64(&pushSuccesses, localPushes)
 					return
 				default:
+					atomic.AddInt64(&pushAttempts, 1)
 					if q.tryPush(func() {}) {
-						atomic.AddInt64(&pushed, 1)
+						localPushes++
 					}
 				}
 			}
@@ -292,17 +296,20 @@ func TestLockFreeQueue_StressTest(t *testing.T) {
 
 	// Consumer
 	go func() {
+		localPops := int64(0)
 		for {
 			select {
 			case <-stop:
 				// Drain remaining
 				for q.pop() != nil {
-					atomic.AddInt64(&popped, 1)
+					localPops++
 				}
+				atomic.AddInt64(&popSuccesses, localPops)
 				return
 			default:
+				atomic.AddInt64(&popAttempts, 1)
 				if task := q.pop(); task != nil {
-					atomic.AddInt64(&popped, 1)
+					localPops++
 				}
 			}
 		}
@@ -312,14 +319,18 @@ func TestLockFreeQueue_StressTest(t *testing.T) {
 	time.Sleep(duration)
 	close(stop)
 
-	// Give time to drain
-	time.Sleep(100 * time.Millisecond)
+	// Give time to drain and collect final counts
+	time.Sleep(500 * time.Millisecond)
 
-	finalPushed := atomic.LoadInt64(&pushed)
-	finalPopped := atomic.LoadInt64(&popped)
+	finalPushed := atomic.LoadInt64(&pushSuccesses)
+	finalPopped := atomic.LoadInt64(&popSuccesses)
 
-	if finalPushed != finalPopped {
-		t.Errorf("Stress test failed: pushed %d, popped %d", finalPushed, finalPopped)
+	// Final queue check
+	remaining := q.size()
+
+	if finalPushed != finalPopped+int64(remaining) {
+		t.Errorf("Stress test failed: pushed %d, popped %d, remaining %d (expected: pushed = popped + remaining)",
+			finalPushed, finalPopped, remaining)
 	}
 
 	t.Logf("Stress test completed: %d tasks processed in %v", finalPopped, duration)

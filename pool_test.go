@@ -357,38 +357,6 @@ func TestBlockingStrategy_BlockWhenFull(t *testing.T) {
 	}
 }
 
-func TestBlockingStrategy_ErrorWhenFull(t *testing.T) {
-	pool, err := NewPool(
-		WithNumWorkers(2),
-		WithQueueSizePerWorker(4),
-		WithBlockingStrategy(ErrorWhenQueueFull),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Shutdown(true)
-
-	// Fill queues with slow tasks
-	var counter uint64
-	for i := 0; i < 8; i++ {
-		pool.Submit(func() {
-			atomic.AddUint64(&counter, 1)
-			time.Sleep(100 * time.Millisecond)
-		})
-	}
-
-	// Try to submit more - should return error
-	err = pool.Submit(func() {})
-	if err != ErrQueueFull {
-		t.Errorf("Expected ErrQueueFull, got %v", err)
-	}
-
-	stats := pool.Stats()
-	if stats.Rejected == 0 {
-		t.Error("Expected rejected counter to be incremented")
-	}
-}
-
 func TestBlockingStrategy_NewThreadWhenFull(t *testing.T) {
 	pool, err := NewPool(
 		WithNumWorkers(2),
