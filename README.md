@@ -632,6 +632,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - 🐛 [Issue Tracker](https://github.com/tahsin716/flock/issues)
 - 💬 [Discussions](https://github.com/tahsin716/flock/discussions)
 
----
-
-Made with ❤️ by [tahsin716](https://github.com/tahsin716)
