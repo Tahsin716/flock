@@ -1,4 +1,7 @@
-# 🦜 Flock
+# Flock
+
+<img  height="360" alt="flock_img" src="https://github.com/user-attachments/assets/606326d0-6504-4416-bf90-80cac3a4149d" />
+
 
 A high-performance, production-ready worker pool library for Go with hybrid queue architecture, lock-free operations, and comprehensive observability.
 
