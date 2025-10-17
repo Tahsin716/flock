@@ -121,7 +121,7 @@ Goroutines: 250.3 ns/op   16 B/op    1 alloc/op
 ### Run Benchmarks
 ```bash
 # Run all benchmarks
-go test -bench=. -benchmem -benchtime=3s
+go test -run=^$ -bench=. -benchmem -benchtime=3s
 
 # Specific comparisons
 go test -bench=BenchmarkComparison -benchmem
