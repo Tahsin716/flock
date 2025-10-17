@@ -61,7 +61,166 @@ type Pool struct {
 	latencyMax   uint64 // atomic
 }
 
-// NewPool creates a new worker pool with the given options.
+// NewPool creates and initializes a new worker pool with the specified configuration.
+//
+// The pool starts immediately upon creation with all workers active and ready to
+// accept tasks. Workers begin in a parked state and wake up as tasks arrive.
+//
+// Configuration is provided through functional options (Option functions). If no
+// options are provided, the pool uses production-ready defaults:
+//   - NumWorkers: runtime.NumCPU()
+//   - QueueSizePerWorker: 256
+//   - MaxParkTime: 10ms
+//   - SpinCount: 30
+//   - BlockingStrategy: BlockWhenQueueFull
+//
+// The pool allocates resources including:
+//   - Worker goroutines (NumWorkers)
+//   - Per-worker lock-free queues (NumWorkers × QueueSizePerWorker slots)
+//   - Global fallback queue (total capacity / 4, minimum 256 slots)
+//   - Metrics tracking structures
+//
+// NewPool validates all configuration options and returns an error if any are
+// invalid. Common validation errors include:
+//   - NumWorkers ≤ 0 or > 10000
+//   - QueueSizePerWorker not a power of 2
+//   - MaxParkTime ≤ 0 or > 1 minute
+//
+// The returned pool must be shut down when no longer needed to release resources:
+//
+//	defer pool.Shutdown(true)
+//
+// Parameters:
+//
+//	opts: Zero or more Option functions to configure the pool
+//
+// Returns:
+//   - *Pool: A running pool ready to accept tasks
+//   - error: Validation error if configuration is invalid, nil otherwise
+//
+// Example - Default configuration:
+//
+//	// Create pool with sensible defaults
+//	pool, err := flock.NewPool()
+//	if err != nil {
+//	    log.Fatalf("Failed to create pool: %v", err)
+//	}
+//	defer pool.Shutdown(true)
+//
+//	// Pool is ready to use
+//	pool.Submit(func() {
+//	    fmt.Println("Hello from worker pool!")
+//	})
+//
+// Example - CPU-bound workload:
+//
+//	// Configure for CPU-intensive tasks
+//	pool, err := flock.NewPool(
+//	    flock.WithNumWorkers(runtime.NumCPU()),
+//	    flock.WithQueueSizePerWorker(256),
+//	    flock.WithSpinCount(50),  // Higher spin for better latency
+//	)
+//	if err != nil {
+//	    log.Fatalf("Failed to create pool: %v", err)
+//	}
+//	defer pool.Shutdown(true)
+//
+// Example - I/O-bound workload:
+//
+//	// Configure for I/O-intensive tasks (web requests, database queries)
+//	pool, err := flock.NewPool(
+//	    flock.WithNumWorkers(runtime.NumCPU() * 4),  // Oversubscribe for I/O
+//	    flock.WithQueueSizePerWorker(1024),          // Larger queues for bursts
+//	    flock.WithMaxParkTime(5 * time.Millisecond), // Wake up faster
+//	)
+//	if err != nil {
+//	    log.Fatalf("Failed to create pool: %v", err)
+//	}
+//	defer pool.Shutdown(true)
+//
+// Example - High-throughput server:
+//
+//	// Configure for maximum throughput with bounded concurrency
+//	pool, err := flock.NewPool(
+//	    flock.WithNumWorkers(runtime.NumCPU() * 2),
+//	    flock.WithQueueSizePerWorker(2048),
+//	    flock.WithBlockingStrategy(flock.BlockWhenQueueFull),  // Backpressure
+//	)
+//	if err != nil {
+//	    log.Fatalf("Failed to create pool: %v", err)
+//	}
+//	defer pool.Shutdown(true)
+//
+// Example - Custom panic handling:
+//
+//	// Configure with custom panic handler for production monitoring
+//	pool, err := flock.NewPool(
+//	    flock.WithPanicHandler(func(r interface{}) {
+//	        log.Printf("Task panicked: %v", r)
+//	        sentry.CaptureException(fmt.Errorf("worker panic: %v", r))
+//	    }),
+//	)
+//	if err != nil {
+//	    log.Fatalf("Failed to create pool: %v", err)
+//	}
+//	defer pool.Shutdown(true)
+//
+// Example - Worker lifecycle hooks:
+//
+//	// Initialize per-worker resources (database connections, buffers, etc.)
+//	var dbConns sync.Map
+//
+//	pool, err := flock.NewPool(
+//	    flock.WithWorkerHooks(
+//	        func(workerID int) {
+//	            // Called when worker starts
+//	            conn, _ := sql.Open("postgres", dsn)
+//	            dbConns.Store(workerID, conn)
+//	            log.Printf("Worker %d initialized", workerID)
+//	        },
+//	        func(workerID int) {
+//	            // Called when worker stops
+//	            if conn, ok := dbConns.Load(workerID); ok {
+//	                conn.(*sql.DB).Close()
+//	            }
+//	            log.Printf("Worker %d shutdown", workerID)
+//	        },
+//	    ),
+//	)
+//	if err != nil {
+//	    log.Fatalf("Failed to create pool: %v", err)
+//	}
+//	defer pool.Shutdown(true)
+//
+// Example - Error handling on full queues:
+//
+//	// Configure to return errors instead of blocking
+//	pool, err := flock.NewPool(
+//	    flock.WithBlockingStrategy(flock.ErrorWhenQueueFull),
+//	)
+//	if err != nil {
+//	    log.Fatalf("Failed to create pool: %v", err)
+//	}
+//	defer pool.Shutdown(true)
+//
+//	// Handle queue full errors explicitly
+//	err = pool.Submit(task)
+//	if err == flock.ErrQueueFull {
+//	    log.Println("Queue full, implementing backoff...")
+//	    time.Sleep(100 * time.Millisecond)
+//	    pool.Submit(task)  // Retry
+//	}
+//
+// Example - Validation error handling:
+//
+//	// Invalid configuration returns error
+//	pool, err := flock.NewPool(
+//	    flock.WithNumWorkers(-1),  // Invalid!
+//	)
+//	if err != nil {
+//	    log.Printf("Invalid configuration: %v", err)
+//	    // Handle error appropriately
+//	}
 func NewPool(opts ...Option) (*Pool, error) {
 	cfg := defaultConfig()
 
@@ -103,7 +262,47 @@ func NewPool(opts ...Option) (*Pool, error) {
 	return pool, nil
 }
 
-// Submit submits a task to the pool.
+// Submit submits a task to the worker pool for asynchronous execution.
+//
+// The task is distributed to workers using a round-robin strategy across all
+// worker queues. If all queues are full, behavior depends on the configured
+// BlockingStrategy:
+//   - BlockWhenQueueFull: Blocks until space becomes available or pool shuts down
+//   - ErrorWhenQueueFull: Returns ErrQueueFull immediately
+//   - NewThreadWhenQueueFull: Executes task in a new goroutine (fallback)
+//
+// Submit is safe for concurrent use by multiple goroutines.
+//
+// Parameters:
+//
+//	task: A function to execute asynchronously. Must not be nil.
+//
+// Returns:
+//   - nil on successful submission
+//   - ErrNilTask if task is nil
+//   - ErrPoolShutdown if pool has been shut down
+//   - ErrQueueFull if queues are full and strategy is ErrorWhenQueueFull
+//
+// Example - Basic submission:
+//
+//	err := pool.Submit(func() {
+//	    fmt.Println("Task executed")
+//	})
+//	if err != nil {
+//	    log.Printf("Failed to submit: %v", err)
+//	}
+//
+// Example - Handling queue full:
+//
+//	pool, _ := flock.NewPool(
+//	    flock.WithBlockingStrategy(flock.ErrorWhenQueueFull),
+//	)
+//	err := pool.Submit(task)
+//	if err == flock.ErrQueueFull {
+//	    // Implement retry logic
+//	    time.Sleep(100 * time.Millisecond)
+//	    pool.Submit(task)
+//	}
 func (p *Pool) Submit(task func()) error {
 	if task == nil {
 		return ErrNilTask
@@ -246,7 +445,70 @@ func (p *Pool) submitWithFallback(task func(), startIdx, numWorkers int) error {
 	}
 }
 
-// Shutdown stops the pool
+// Shutdown stops the worker pool and waits for workers to exit.
+//
+// The graceful parameter controls shutdown behavior:
+//
+// Graceful Shutdown (true):
+//   - Stops accepting new tasks (Submit returns ErrPoolShutdown)
+//   - Workers drain their queues and execute all pending tasks
+//   - Blocks until all tasks complete and workers exit
+//   - Waits for fallback goroutines (if using NewThreadWhenQueueFull)
+//
+// Immediate Shutdown (false):
+//   - Stops accepting new tasks (Submit returns ErrPoolShutdown)
+//   - Workers finish currently executing tasks only
+//   - Remaining queued tasks are dropped (counted in stats.Dropped)
+//   - Blocks until workers and fallback goroutines exit
+//
+// Multiple calls to Shutdown are safe. Subsequent calls after the first
+// are ignored (no-op). Shutdown is safe for concurrent use, though typically
+// only one goroutine should call it.
+//
+// After Shutdown completes, the pool cannot be restarted. Create a new pool
+// if needed.
+//
+// Parameters:
+//
+//	graceful: true to drain queues, false to stop immediately
+//
+// Example - Graceful shutdown:
+//
+//	pool, _ := flock.NewPool()
+//	defer pool.Shutdown(true)  // Ensures all tasks complete
+//
+//	for i := 0; i < 1000; i++ {
+//	    pool.Submit(task)
+//	}
+//	// Shutdown waits for all 1000 tasks to complete
+//
+// Example - Immediate shutdown:
+//
+//	pool, _ := flock.NewPool()
+//
+//	for i := 0; i < 1000; i++ {
+//	    pool.Submit(task)
+//	}
+//
+//	pool.Shutdown(false)  // May drop queued tasks
+//	stats := pool.Stats()
+//	fmt.Printf("Dropped %d tasks\n", stats.Dropped)
+//
+// Example - Shutdown with timeout:
+//
+//	done := make(chan struct{})
+//	go func() {
+//	    pool.Shutdown(true)
+//	    close(done)
+//	}()
+//
+//	select {
+//	case <-done:
+//	    log.Println("Graceful shutdown completed")
+//	case <-time.After(30 * time.Second):
+//	    log.Println("Timeout, forcing immediate shutdown")
+//	    pool.Shutdown(false)
+//	}
 func (p *Pool) Shutdown(graceful bool) {
 	if graceful {
 		if !p.state.CompareAndSwap(poolStateRunning, poolStateDraining) {
@@ -284,12 +546,113 @@ func (p *Pool) Shutdown(graceful bool) {
 	}
 }
 
-// Wait blocks until all submitted tasks have completed
+// Wait blocks until all submitted tasks have completed execution.
+//
+// Wait does NOT shut down the pool - after Wait returns, the pool remains
+// active and can accept new tasks. This is useful for checkpointing or
+// ensuring all tasks complete before proceeding to the next phase.
+//
+// Tasks that panic are still counted as completed. Tasks rejected with
+// ErrQueueFull or ErrPoolShutdown are not tracked by Wait.
+//
+// Wait is safe for concurrent use by multiple goroutines, though typically
+// only one goroutine should call Wait.
+//
+// Example - Wait for batch completion:
+//
+//	// Submit batch of tasks
+//	for i := 0; i < 1000; i++ {
+//	    pool.Submit(processTask(i))
+//	}
+//
+//	// Wait for batch to complete
+//	pool.Wait()
+//	fmt.Println("Batch complete, starting next batch")
+//
+//	// Submit more tasks
+//	for i := 1000; i < 2000; i++ {
+//	    pool.Submit(processTask(i))
+//	}
+//
+// Example - Periodic checkpoints:
+//
+//	for batchNum := 0; batchNum < 10; batchNum++ {
+//	    for i := 0; i < 100; i++ {
+//	        pool.Submit(task)
+//	    }
+//	    pool.Wait()
+//	    log.Printf("Completed batch %d", batchNum)
+//	}
 func (p *Pool) Wait() {
 	p.submitWg.Wait()
 }
 
-// Stats returns a snapshot of pool statistics
+// Stats returns a snapshot of current pool statistics and performance metrics.
+//
+// The returned Stats struct contains comprehensive information about:
+//   - Task counts (submitted, completed, dropped, rejected, in-flight)
+//   - Queue utilization and capacity
+//   - Execution latency (average and maximum)
+//   - Per-worker statistics (tasks executed, failures, state)
+//
+// Stats are collected without locks for performance, so values may be slightly
+// inconsistent during concurrent operations. For example, Submitted might be
+// read slightly before Completed, causing temporary inaccuracies. These
+// inconsistencies are negligible for monitoring purposes.
+//
+// Stats can be called at any time, including during active task execution or
+// after shutdown. It is safe for concurrent use by multiple goroutines.
+//
+// The Stats struct is a snapshot - modifications to the returned struct do not
+// affect the pool's internal state.
+//
+// Returns:
+//
+//	A Stats struct containing current pool metrics
+//
+// Example - Basic monitoring:
+//
+//	stats := pool.Stats()
+//	fmt.Printf("Throughput: %d/%d completed\n", stats.Completed, stats.Submitted)
+//	fmt.Printf("Queue utilization: %.2f%%\n", stats.Utilization)
+//	fmt.Printf("Average latency: %v\n", stats.LatencyAvg)
+//
+// Example - Health check:
+//
+//	stats := pool.Stats()
+//	if stats.Utilization > 90.0 {
+//	    log.Println("WARNING: Queue utilization high, consider scaling")
+//	}
+//	if stats.FallbackExecuted > stats.Completed*0.1 {
+//	    log.Println("WARNING: High fallback rate, increase queue size")
+//	}
+//
+// Example - Per-worker analysis:
+//
+//	stats := pool.Stats()
+//	for _, ws := range stats.WorkerStats {
+//	    failureRate := float64(ws.TasksFailed) / float64(ws.TasksExecuted) * 100
+//	    if failureRate > 5.0 {
+//	        log.Printf("Worker %d has high failure rate: %.2f%%",
+//	            ws.WorkerID, failureRate)
+//	    }
+//	}
+//
+// Example - Periodic metrics export:
+//
+//	ticker := time.NewTicker(10 * time.Second)
+//	go func() {
+//	    for range ticker.C {
+//	        stats := pool.Stats()
+//
+//	        // Export to monitoring system
+//	        metrics.Gauge("pool.submitted").Set(stats.Submitted)
+//	        metrics.Gauge("pool.completed").Set(stats.Completed)
+//	        metrics.Gauge("pool.inflight").Set(stats.InFlight)
+//	        metrics.Gauge("pool.utilization").Set(stats.Utilization)
+//	        metrics.Histogram("pool.latency").Observe(stats.LatencyAvg.Seconds())
+//	    }
+//	}()
 func (p *Pool) Stats() Stats {
 	// Aggregate sharded metrics
 	var submitted, completed, dropped, rejected, fallback uint64
@@ -361,12 +724,108 @@ func (p *Pool) Stats() Stats {
 	}
 }
 
-// IsShutdown returns true if the pool has been shut down
+// IsShutdown returns true if the pool has been shut down and is no longer
+// accepting new tasks.
+//
+// A pool is considered shutdown when Shutdown() has been called and the
+// shutdown process has completed. During graceful shutdown (while tasks are
+// draining), IsShutdown returns false until all tasks complete.
+//
+// IsShutdown is useful for:
+//   - Checking if a pool is still usable before submitting tasks
+//   - Coordinating shutdown across multiple components
+//   - Testing and debugging shutdown behavior
+//
+// IsShutdown is safe for concurrent use by multiple goroutines.
+//
+// Returns:
+//
+//	true if pool is fully shutdown, false otherwise
+//
+// Example - Conditional submission:
+//
+//	if !pool.IsShutdown() {
+//	    err := pool.Submit(task)
+//	    if err != nil {
+//	        log.Printf("Submission failed: %v", err)
+//	    }
+//	} else {
+//	    log.Println("Pool is shutdown, cannot submit task")
+//	}
+//
+// Example - Graceful degradation:
+//
+//	var primaryPool, backupPool *flock.Pool
+//
+//	func submitTask(task func()) error {
+//	    if !primaryPool.IsShutdown() {
+//	        return primaryPool.Submit(task)
+//	    }
+//	    if !backupPool.IsShutdown() {
+//	        return backupPool.Submit(task)
+//	    }
+//	    return errors.New("all pools are shutdown")
+//	}
+//
+// Example - Shutdown coordination:
+//
+//	// Coordinated shutdown of multiple pools
+//	pools := []*flock.Pool{pool1, pool2, pool3}
+//
+//	// Initiate shutdown
+//	for _, p := range pools {
+//	    go p.Shutdown(true)
+//	}
+//
+//	// Wait for all to complete
+//	for {
+//	    allShutdown := true
+//	    for _, p := range pools {
+//	        if !p.IsShutdown() {
+//	            allShutdown = false
+//	            break
+//	        }
+//	    }
+//	    if allShutdown {
+//	        break
+//	    }
+//	    time.Sleep(100 * time.Millisecond)
+//	}
 func (p *Pool) IsShutdown() bool {
 	return p.state.Load().(PoolState) == poolStateStopped
 }
 
-// NumWorkers returns the number of workers in the pool
+// NumWorkers returns the number of worker goroutines in the pool.
+//
+// This value is fixed at pool creation and never changes during the pool's
+// lifetime. It represents the maximum number of tasks that can execute
+// concurrently.
+//
+// NumWorkers is useful for:
+//   - Calculating total queue capacity (NumWorkers × QueueSizePerWorker)
+//   - Understanding concurrency limits
+//   - Debugging and logging pool configuration
+//
+// NumWorkers is safe for concurrent use by multiple goroutines.
+//
+// Returns:
+//
+//	The number of workers, as specified during pool creation
+//
+// Example - Capacity calculation:
+//
+//	totalCapacity := pool.NumWorkers() * queueSizePerWorker
+//	fmt.Printf("Pool can queue up to %d tasks\n", totalCapacity)
+//
+// Example - Dynamic sizing:
+//
+//	numWorkers := pool.NumWorkers()
+//	optimalBatchSize := numWorkers * 10
+//	fmt.Printf("Recommended batch size: %d\n", optimalBatchSize)
+//
+// Example - Logging configuration:
+//
+//	log.Printf("Pool initialized with %d workers", pool.NumWorkers())
 func (p *Pool) NumWorkers() int {
 	return len(p.workers)
 }
