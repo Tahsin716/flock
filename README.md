@@ -7,7 +7,7 @@
 A high-performance, production-ready worker pool library for Go with hybrid queue architecture, lock-free operations, and comprehensive observability.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/tahsin716/flock.svg)](https://pkg.go.dev/github.com/tahsin716/flock)
-[![Go Report Card](https://goreportcard.com/badge/github.com/tahsin716/flock)](https://goreportcard.com/report/github.com/Tahsin716/flock)
+[![Go Report Card](https://goreportcard.com/badge/github.com/tahsin716/flock)](https://goreportcard.com/report/github.com/tahsin716/flock)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## ✨ Features
