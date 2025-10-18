@@ -185,7 +185,7 @@ func (q *lockFreeQueue) isEmpty() bool {
 }
 
 // isFull checks if the queue appears full
-func (q *lockFreeQueue) isFuoll() bool {
+func (q *lockFreeQueue) isFull() bool {
 	head := atomic.LoadUint64(&q.head)
 	tail := atomic.LoadUint64(&q.tail)
 	return tail-head >= q.queueSize-1
