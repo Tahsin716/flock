@@ -12,11 +12,11 @@ type cacheLinePad struct {
 }
 
 // lockFreeQueue is a bounded, lock-free, MPSC queue
-// Optimized for low contention with exponential backoff for high contention
+// Optimized for performance while maintaining correctness
 type lockFreeQueue struct {
 	_ cacheLinePad
 
-	// head is only modified by single consumer
+	// head is only modified by consumer
 	head uint64
 
 	_ cacheLinePad
@@ -27,13 +27,11 @@ type lockFreeQueue struct {
 	_ cacheLinePad
 
 	buffer    []unsafe.Pointer
-	sequences []uint64 // Per-slot sequence numbers
+	sequences []uint64
 	mask      uint64
 	queueSize uint64
 }
 
-// newQueue creates a new bounded lock-free MPSC queue
-// Capacity must be a power of two
 func newQueue(capacity int) *lockFreeQueue {
 	if capacity <= 0 || capacity&(capacity-1) != 0 {
 		panic("capacity must be a power of two and > 0")
@@ -44,21 +42,17 @@ func newQueue(capacity int) *lockFreeQueue {
 		sequences: make([]uint64, capacity),
 		mask:      uint64(capacity - 1),
 		queueSize: uint64(capacity),
-		head:      0,
-		tail:      0,
 	}
 
-	// Initialize sequences
 	for i := range q.sequences {
-		atomic.StoreUint64(&q.sequences[i], uint64(i))
+		q.sequences[i] = uint64(i) // Initialize sequence numbers
+		q.buffer[i] = nil          // Initialize buffer to nil
 	}
 
 	return q
 }
 
-// tryPush attempts to push a task to the queue (MPSC-safe)
-// Returns true if successful, false if full
-// Uses exponential backoff to reduce contention
+// tryPush attempts to push a task (multiple producers)
 func (q *lockFreeQueue) tryPush(task func()) bool {
 	if task == nil {
 		return false
@@ -68,79 +62,67 @@ func (q *lockFreeQueue) tryPush(task func()) bool {
 	const maxAttempts = 128
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Load current tail
 		tail := atomic.LoadUint64(&q.tail)
 		index := tail & q.mask
-
-		// Check the sequence number for this slot
 		seq := atomic.LoadUint64(&q.sequences[index])
-
-		// Calculate the difference (handles wrap-around)
 		diff := int64(seq) - int64(tail)
 
 		if diff == 0 {
-			// Slot is ready for writing
-			// Try to claim this slot by advancing tail
 			if atomic.CompareAndSwapUint64(&q.tail, tail, tail+1) {
-				// Successfully claimed - now write the task
+				// Store pointer atomically (ensures visibility)
 				atomic.StorePointer(&q.buffer[index], taskPtr)
 
-				// Update sequence to signal data is ready
-				// Consumer expects sequence to be tail + 1
+				// Release barrier: ensures buffer write completes before sequence update
 				atomic.StoreUint64(&q.sequences[index], tail+1)
 				return true
 			}
 		} else if diff < 0 {
-			return false // queue is full
+			return false
 		}
 
-		// Simple backoff
 		runtime.Gosched()
 	}
 
 	return false
 }
 
-// pop removes and returns one task (single consumer only - not thread-safe)
+// pop removes one task (single consumer)
 func (q *lockFreeQueue) pop() func() {
-	head := atomic.LoadUint64(&q.head)
+	// Non-atomic read, single consumer only modifies this
+	head := q.head
 	index := head & q.mask
 
-	// Check the sequence number
+	// Atomic load (synchronizes with producer's sequence update)
 	seq := atomic.LoadUint64(&q.sequences[index])
 
-	// We expect sequence to be head + 1 (data ready)
 	if seq != head+1 {
-		// Data not ready yet, or slot is empty
 		return nil
 	}
 
-	// Load the task
+	// Atomic load (ensures we see producer's buffer write)
 	taskPtr := atomic.LoadPointer(&q.buffer[index])
-
 	if taskPtr == nil {
-		// This shouldn't happen in correct usage
-		panic("[Flock] Error in MPSC queue design, taskPtr is nil")
+		panic("[Flock] MPSC queue error: nil task")
 	}
 
-	// Clear the slot
-	atomic.StorePointer(&q.buffer[index], nil)
+	// Non-atomic write (single consumer, producers don't read buffer)
+	q.buffer[index] = nil
 
-	// Update sequence to signal slot is available for writing
-	// Next producer expects sequence to be head + queueSize
+	// Update sequence atomically (producers read this)
 	atomic.StoreUint64(&q.sequences[index], head+q.queueSize)
 
-	// Advance head
-	atomic.StoreUint64(&q.head, head+1)
+	// Update head: non-atomic then atomic to publish to producers
+	newHead := head + 1
+	q.head = newHead                     // Local cache update
+	atomic.StoreUint64(&q.head, newHead) // Publish to producers
 
-	// Convert back to function
 	task := *(*func())(taskPtr)
 	return task
 }
 
-// size returns the approximate queue length
-// This is a snapshot and may be stale during concurrent operations
+// size returns approximate queue length
 func (q *lockFreeQueue) size() int {
+	// Load with atomic to see latest values
 	head := atomic.LoadUint64(&q.head)
 	tail := atomic.LoadUint64(&q.tail)
 
@@ -155,31 +137,31 @@ func (q *lockFreeQueue) size() int {
 	return size
 }
 
-// isEmpty checks if the queue appears empty
+// isEmpty checks if queue appears empty
 func (q *lockFreeQueue) isEmpty() bool {
 	head := atomic.LoadUint64(&q.head)
 	tail := atomic.LoadUint64(&q.tail)
 	return head >= tail
 }
 
-// isFull checks if the queue appears full
+// isFull checks if queue appears full
 func (q *lockFreeQueue) isFull() bool {
 	head := atomic.LoadUint64(&q.head)
 	tail := atomic.LoadUint64(&q.tail)
 	return tail-head >= q.queueSize-1
 }
 
-// capacity returns the queue's maximum capacity
+// capacity returns queue capacity
 func (q *lockFreeQueue) capacity() int {
 	return int(q.queueSize)
 }
 
-// reset clears the queue (not thread-safe - use only when no concurrent operations)
+// reset clears the queue (not thread-safe)
 func (q *lockFreeQueue) reset() {
 	for i := range q.buffer {
-		atomic.StorePointer(&q.buffer[i], nil)
-		atomic.StoreUint64(&q.sequences[i], uint64(i))
+		q.buffer[i] = nil
+		q.sequences[i] = uint64(i)
 	}
-	atomic.StoreUint64(&q.head, 0)
-	atomic.StoreUint64(&q.tail, 0)
+	q.head = 0
+	q.tail = 0
 }
