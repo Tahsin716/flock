@@ -3,7 +3,6 @@ package flock
 import (
 	"runtime"
 	"sync/atomic"
-	"unsafe"
 )
 
 // cacheLinePad prevents false sharing between hot fields
@@ -26,7 +25,7 @@ type lockFreeQueue struct {
 
 	_ cacheLinePad
 
-	buffer    []unsafe.Pointer
+	buffer    []atomic.Pointer[func()]
 	sequences []uint64
 	mask      uint64
 	queueSize uint64
@@ -40,7 +39,7 @@ func newQueue(capacity int) *lockFreeQueue {
 	}
 
 	q := &lockFreeQueue{
-		buffer:    make([]unsafe.Pointer, capacity),
+		buffer:    make([]atomic.Pointer[func()], capacity),
 		sequences: make([]uint64, capacity),
 		mask:      uint64(capacity - 1),
 		queueSize: uint64(capacity),
@@ -48,7 +47,7 @@ func newQueue(capacity int) *lockFreeQueue {
 
 	for i := range q.sequences {
 		q.sequences[i] = uint64(i) // Initialize sequence numbers
-		q.buffer[i] = nil          // Initialize buffer to nil
+		q.buffer[i].Store(nil)     // Initialize buffer slots
 	}
 
 	return q
@@ -62,7 +61,6 @@ func (q *lockFreeQueue) tryPush(task func()) bool {
 		return false
 	}
 
-	taskPtr := unsafe.Pointer(&task)
 	const maxAttempts = 128
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -79,7 +77,7 @@ func (q *lockFreeQueue) tryPush(task func()) bool {
 		if diff == 0 {
 			if atomic.CompareAndSwapUint64(&q.tail, tail, tail+1) {
 				// Store pointer atomically (ensures visibility)
-				atomic.StorePointer(&q.buffer[index], taskPtr)
+				q.buffer[index].Store(&task)
 
 				// Release barrier: ensures buffer write completes before sequence update
 				atomic.StoreUint64(&q.sequences[index], tail+1)
@@ -109,13 +107,13 @@ func (q *lockFreeQueue) pop() func() {
 	}
 
 	// Atomic load (ensures we see producer's buffer write)
-	taskPtr := atomic.LoadPointer(&q.buffer[index])
+	taskPtr := q.buffer[index].Load()
 	if taskPtr == nil {
 		panic("[Flock] MPSC queue error: nil task")
 	}
 
-	// Non-atomic write (single consumer, producers don't read buffer)
-	q.buffer[index] = nil
+	// remove task from buffer
+	q.buffer[index].Store(nil)
 
 	// Update sequence atomically (producers read this)
 	atomic.StoreUint64(&q.sequences[index], head+q.queueSize)
@@ -125,7 +123,7 @@ func (q *lockFreeQueue) pop() func() {
 	q.head = newHead                     // Local cache update
 	atomic.StoreUint64(&q.head, newHead) // Publish to producers
 
-	task := *(*func())(taskPtr)
+	task := *taskPtr
 	return task
 }
 
@@ -168,7 +166,7 @@ func (q *lockFreeQueue) capacity() int {
 // reset clears the queue (not thread-safe)
 func (q *lockFreeQueue) reset() {
 	for i := range q.buffer {
-		q.buffer[i] = nil
+		q.buffer[i].Store(nil)
 		q.sequences[i] = uint64(i)
 	}
 	q.head = 0
