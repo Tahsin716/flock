@@ -32,6 +32,8 @@ type lockFreeQueue struct {
 	queueSize uint64
 }
 
+// newQueue creates a new bounded lock-free MPSC queue
+// Capacity must be a power of two
 func newQueue(capacity int) *lockFreeQueue {
 	if capacity <= 0 || capacity&(capacity-1) != 0 {
 		panic("capacity must be a power of two and > 0")
@@ -52,7 +54,9 @@ func newQueue(capacity int) *lockFreeQueue {
 	return q
 }
 
-// tryPush attempts to push a task (multiple producers)
+// tryPush attempts to push a task to the queue (MPSC-safe)
+// Returns true if successful, false if full
+// Uses exponential backoff to reduce contention
 func (q *lockFreeQueue) tryPush(task func()) bool {
 	if task == nil {
 		return false
@@ -64,8 +68,13 @@ func (q *lockFreeQueue) tryPush(task func()) bool {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		tail := atomic.LoadUint64(&q.tail)
 		index := tail & q.mask
+
+		// Atomic load (synchronizes with consumer's sequence update)
+		// This ensures we see the latest sequence number
+		// and prevents ABA issues
 		seq := atomic.LoadUint64(&q.sequences[index])
-		diff := int64(seq) - int64(tail)
+
+		diff := int64(seq) - int64(tail) // handle wraparound zero
 
 		if diff == 0 {
 			if atomic.CompareAndSwapUint64(&q.tail, tail, tail+1) {
