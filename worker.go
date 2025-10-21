@@ -136,20 +136,46 @@ func (w *worker) findTask() func() {
 		return task
 	}
 
-	// Priority 2: Global queue (optimized Go channel, good under contention)
-	select {
-	case task, ok := <-w.pool.globalQueue:
-		if !ok {
-			// Global queue closed (shutdown)
-			return nil
+	// Priority 2: Batch refill from global queue
+	if w.batchRefillFromGlobal() {
+		// Try local again after refill
+		if task := w.queue.pop(); task != nil {
+			return task
 		}
-		return task
-	default:
-		// Global queue empty, continue to parking
 	}
 
 	// Priority 3: Park and wait
 	return w.parkAndWait()
+}
+
+func (w *worker) batchRefillFromGlobal() bool {
+	const maxBatch = 16 // Max tasks to refill in one go
+
+	refilled := false
+
+	for i := 0; i < maxBatch; i++ {
+		select {
+		case task, ok := <-w.pool.globalQueue:
+			if !ok {
+				return refilled // Channel closed
+			}
+
+			// Try to push to local queue
+			if w.queue.tryPush(task) {
+				refilled = true
+			} else {
+				// Local queue full,
+				// execute immediately
+				w.executeTask(task)
+				return refilled
+			}
+		default:
+			// Global queue empty
+			return refilled
+		}
+	}
+
+	return refilled
 }
 
 // parkAndWait parks the worker until work is available
