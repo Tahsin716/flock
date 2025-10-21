@@ -95,8 +95,8 @@ func (q *lockFreeQueue) tryPush(task func()) bool {
 
 // pop removes one task (single consumer)
 func (q *lockFreeQueue) pop() func() {
-	// Non-atomic read, single consumer only modifies this
-	head := q.head
+	// Atomic load to see latest head
+	head := atomic.LoadUint64(&q.head)
 	index := head & q.mask
 
 	// Atomic load (synchronizes with producer's sequence update)
@@ -108,9 +108,6 @@ func (q *lockFreeQueue) pop() func() {
 
 	// Atomic load (ensures we see producer's buffer write)
 	taskPtr := q.buffer[index].Load()
-	if taskPtr == nil {
-		panic("[Flock] MPSC queue error: nil task")
-	}
 
 	// remove task from buffer
 	q.buffer[index].Store(nil)
@@ -118,10 +115,8 @@ func (q *lockFreeQueue) pop() func() {
 	// Update sequence atomically (producers read this)
 	atomic.StoreUint64(&q.sequences[index], head+q.queueSize)
 
-	// Update head: non-atomic then atomic to publish to producers
-	newHead := head + 1
-	q.head = newHead                     // Local cache update
-	atomic.StoreUint64(&q.head, newHead) // Publish to producers
+	// Advance head
+	atomic.StoreUint64(&q.head, head+1)
 
 	task := *taskPtr
 	return task
