@@ -1,7 +1,6 @@
 package flock
 
 import (
-	"math/rand"
 	"runtime"
 	"sync"
 	"testing"
@@ -9,10 +8,10 @@ import (
 )
 
 // ============================================================================
-// Throughput Under Different Task Durations
+// INSTANT TASK BENCHMARKS
 // ============================================================================
 
-func BenchmarkThroughput_Pool_Instant(b *testing.B) {
+func BenchmarkThroughput_Instant_SingleProducer_Flock(b *testing.B) {
 	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()),
 		WithQueueSizePerWorker(1024),
@@ -20,152 +19,368 @@ func BenchmarkThroughput_Pool_Instant(b *testing.B) {
 	defer pool.Shutdown(true)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		pool.Submit(func() {
-			// Instant task
-		})
-	}
-	pool.Wait()
-
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
-}
-
-func BenchmarkThroughput_Goroutines_Instant(b *testing.B) {
-	b.ResetTimer()
-	var wg sync.WaitGroup
-
 	start := time.Now()
+
 	for i := 0; i < b.N; i++ {
-		wg.Add(1)
-		go func() {
-			// Instant task
-			wg.Done()
-		}()
-	}
-	wg.Wait()
-
-	b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "tasks/sec")
-}
-
-func BenchmarkThroughput_Pool_1us(b *testing.B) {
-	pool, _ := NewPool(
-		WithNumWorkers(runtime.NumCPU()*2),
-		WithQueueSizePerWorker(1024),
-	)
-	defer pool.Shutdown(true)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		pool.Submit(func() {
-			time.Sleep(time.Microsecond)
-		})
+		pool.Submit(func() {})
 	}
 	pool.Wait()
 
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
 }
 
-func BenchmarkThroughput_Goroutines_1us(b *testing.B) {
-	b.ResetTimer()
+func BenchmarkThroughput_Instant_SingleProducer_Goroutines(b *testing.B) {
 	var wg sync.WaitGroup
 
+	b.ResetTimer()
 	start := time.Now()
-	for i := 0; i < b.N; i++ {
-		wg.Add(1)
-		go func() {
-			time.Sleep(time.Microsecond)
-			wg.Done()
-		}()
-	}
-	wg.Wait()
 
-	b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "tasks/sec")
-}
-
-func BenchmarkThroughput_Pool_10us(b *testing.B) {
-	pool, _ := NewPool(
-		WithNumWorkers(runtime.NumCPU()*10),
-		WithQueueSizePerWorker(512),
-	)
-	defer pool.Shutdown(true)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		pool.Submit(func() {
-			time.Sleep(10 * time.Microsecond)
-		})
-	}
-	pool.Wait()
-
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "tasks/sec")
-}
-
-func BenchmarkThroughput_Goroutines_10us(b *testing.B) {
-	b.ResetTimer()
-	var wg sync.WaitGroup
-
-	start := time.Now()
-	for i := 0; i < b.N; i++ {
-		wg.Add(1)
-		go func() {
-			time.Sleep(10 * time.Microsecond)
-			wg.Done()
-		}()
-	}
-	wg.Wait()
-
-	b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "tasks/sec")
-}
-
-// ============================================================================
-// Pool vs Goroutine CPU Bound tasks
-// ============================================================================
-
-func BenchmarkComparison_Pool_CPUBound(b *testing.B) {
-	pool, _ := NewPool()
-	defer pool.Shutdown(true)
-
-	cpuWork := func() {
-		sum := 0
-		for i := 0; i < 1000; i++ {
-			sum += i
-		}
-		_ = sum
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		pool.Submit(cpuWork)
-	}
-	pool.Wait()
-}
-
-func BenchmarkComparison_Goroutines_CPUBound(b *testing.B) {
-	cpuWork := func() {
-		sum := 0
-		for i := 0; i < 1000; i++ {
-			sum += i
-		}
-		_ = sum
-	}
-
-	b.ResetTimer()
-	var wg sync.WaitGroup
 	for i := 0; i < b.N; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			cpuWork()
 		}()
 	}
 	wg.Wait()
+
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkThroughput_Instant_MultipleProducers_Flock(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(512),
+	)
+	defer pool.Shutdown(true)
+
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				pool.Submit(func() {})
+			}
+		}()
+	}
+	wg.Wait()
+	pool.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkThroughput_Instant_MultipleProducers_Goroutines(b *testing.B) {
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+				}()
+			}
+		}()
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
 }
 
 // ============================================================================
-// Pool vs Goroutine Memory Allocation
+// 1 MICROSECOND TASK BENCHMARKS
 // ============================================================================
 
-func BenchmarkComparison_Pool_MemoryAlloc(b *testing.B) {
+func BenchmarkThroughput_1us_Flock(b *testing.B) {
+	// FIX: Use more workers for I/O-bound tasks
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*4),
+		WithQueueSizePerWorker(512),
+	)
+	defer pool.Shutdown(true)
+
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				pool.Submit(func() {
+					time.Sleep(1 * time.Microsecond)
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	pool.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkThroughput_1us_Goroutines(b *testing.B) {
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					time.Sleep(1 * time.Microsecond)
+				}()
+			}
+		}()
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+// ============================================================================
+// 10 MICROSECOND TASK BENCHMARKS
+// ============================================================================
+
+func BenchmarkThroughput_10us_Flock(b *testing.B) {
+	// FIX: Use even more workers for longer I/O tasks
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*10),
+		WithQueueSizePerWorker(1024),
+	)
+	defer pool.Shutdown(true)
+
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				pool.Submit(func() {
+					time.Sleep(10 * time.Microsecond)
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	pool.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkThroughput_10us_Goroutines(b *testing.B) {
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					time.Sleep(10 * time.Microsecond)
+				}()
+			}
+		}()
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+// ============================================================================
+// 100 MICROSECOND TASK BENCHMARKS
+// ============================================================================
+
+func BenchmarkThroughput_100us_Flock(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*50),
+		WithQueueSizePerWorker(2048),
+	)
+	defer pool.Shutdown(true)
+
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				pool.Submit(func() {
+					time.Sleep(100 * time.Microsecond)
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	pool.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkThroughput_100us_Goroutines(b *testing.B) {
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					time.Sleep(100 * time.Microsecond)
+				}()
+			}
+		}()
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+// ============================================================================
+// CPU-BOUND TASK BENCHMARKS
+// ============================================================================
+
+func BenchmarkThroughput_CPUBound_Flock(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(512),
+	)
+	defer pool.Shutdown(true)
+
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				pool.Submit(func() {
+					sum := 0
+					for k := 0; k < 1000; k++ {
+						sum += k
+					}
+					_ = sum
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	pool.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkThroughput_CPUBound_Goroutines(b *testing.B) {
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					sum := 0
+					for k := 0; k < 1000; k++ {
+						sum += k
+					}
+					_ = sum
+				}()
+			}
+		}()
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+// ============================================================================
+// MEMORY ALLOCATION BENCHMARKS
+// ============================================================================
+
+func BenchmarkMemory_Alloc_Flock(b *testing.B) {
 	pool, _ := NewPool()
 	defer pool.Shutdown(true)
 
@@ -178,11 +393,12 @@ func BenchmarkComparison_Pool_MemoryAlloc(b *testing.B) {
 	pool.Wait()
 }
 
-func BenchmarkComparison_Goroutines_MemoryAlloc(b *testing.B) {
+func BenchmarkMemory_Alloc_Goroutines(b *testing.B) {
+	var wg sync.WaitGroup
+
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	var wg sync.WaitGroup
 	for i := 0; i < b.N; i++ {
 		wg.Add(1)
 		go func() {
@@ -193,122 +409,149 @@ func BenchmarkComparison_Goroutines_MemoryAlloc(b *testing.B) {
 }
 
 // ============================================================================
-// Pool vs Goroutine under different loads
+// MIXED WORKLOAD BENCHMARKS
 // ============================================================================
 
-func Benchmark_Pool_MixedLoad(b *testing.B) {
-	slowTask := func() { time.Sleep(100 * time.Microsecond) }
-	fastTask := func() {}
-
+func BenchmarkThroughput_MixedLoad_Flock(b *testing.B) {
 	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()*10),
-		WithQueueSizePerWorker(512),
+		WithQueueSizePerWorker(1024),
 	)
 	defer pool.Shutdown(true)
 
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
 	b.ResetTimer()
-	b.SetParallelism(100)
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			// Random workload pattern: 10% slow, 90% fast
-			if rand.Intn(10) == 0 {
-				pool.Submit(slowTask)
-			} else {
-				pool.Submit(fastTask)
-			}
-
-			// Small jitter between requests (simulating uneven arrivals)
-			if rand.Intn(100) == 0 {
-				time.Sleep(50 * time.Microsecond)
-			}
-		}
-	})
-
-	pool.Wait()
-}
-
-func Benchmark_Goroutines_MixedLoad(b *testing.B) {
-	slowTask := func() { time.Sleep(100 * time.Microsecond) }
-	fastTask := func() {}
+	start := time.Now()
 
 	var wg sync.WaitGroup
-	b.ResetTimer()
-	b.SetParallelism(100)
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			wg.Add(1)
-			if rand.Intn(10) == 0 {
-				go func() {
-					defer wg.Done()
-					slowTask()
-				}()
-			} else {
-				go func() {
-					defer wg.Done()
-					fastTask()
-				}()
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				if j%10 == 0 {
+					// 10% slow tasks
+					pool.Submit(func() {
+						time.Sleep(100 * time.Microsecond)
+					})
+				} else {
+					// 90% instant tasks
+					pool.Submit(func() {})
+				}
 			}
-
-			// Random request jitter
-			if rand.Intn(100) == 0 {
-				time.Sleep(50 * time.Microsecond)
-			}
-		}
-	})
-
+		}()
+	}
 	wg.Wait()
+	pool.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
 }
 
-func BenchmarkBurst_Pool_SpikeyLoad(b *testing.B) {
+func BenchmarkThroughput_MixedLoad_Goroutines(b *testing.B) {
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < tasksPerProducer; j++ {
+				wg.Add(1)
+				if j%10 == 0 {
+					go func() {
+						defer wg.Done()
+						time.Sleep(100 * time.Microsecond)
+					}()
+				} else {
+					go func() {
+						defer wg.Done()
+					}()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	actualTasks := numProducers * tasksPerProducer
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+// ============================================================================
+// BURST LOAD BENCHMARKS
+// ============================================================================
+
+func BenchmarkThroughput_BurstLoad_Flock(b *testing.B) {
 	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()*10),
-		WithQueueSizePerWorker(512),
+		WithQueueSizePerWorker(1024),
 	)
 	defer pool.Shutdown(true)
 
+	const tasksPerBurst = 100
+	burstsNeeded := (b.N + tasksPerBurst - 1) / tasksPerBurst
+
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		// Simulate burst: 100 tasks at once
-		for j := 0; j < 100; j++ {
+	start := time.Now()
+
+	for i := 0; i < burstsNeeded; i++ {
+		// Submit burst
+		for t := 0; t < tasksPerBurst; t++ {
 			pool.Submit(func() {
 				time.Sleep(10 * time.Microsecond)
 			})
 		}
-		pool.Wait()
-
-		// Small gap between bursts
-		time.Sleep(100 * time.Microsecond)
+		pool.Wait() // Wait between bursts
 	}
+
+	elapsed := time.Since(start)
+	actualTasks := burstsNeeded * tasksPerBurst
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
 }
 
-func BenchmarkBurst_Goroutines_SpikeyLoad(b *testing.B) {
+func BenchmarkThroughput_BurstLoad_Goroutines(b *testing.B) {
 	b.ResetTimer()
+	start := time.Now()
+
+	burstsPerIteration := 10
+	tasksPerBurst := 100
+	totalTasks := 0
+
 	for i := 0; i < b.N; i++ {
-		var wg sync.WaitGroup
-		wg.Add(100)
+		for burst := 0; burst < burstsPerIteration; burst++ {
+			var wg sync.WaitGroup
+			wg.Add(tasksPerBurst)
 
-		// Simulate burst: 100 goroutines at once
-		for j := 0; j < 100; j++ {
-			go func() {
-				defer wg.Done()
-				time.Sleep(10 * time.Microsecond)
-			}()
+			for t := 0; t < tasksPerBurst; t++ {
+				go func() {
+					defer wg.Done()
+					time.Sleep(10 * time.Microsecond)
+				}()
+			}
+			wg.Wait()
+			totalTasks += tasksPerBurst
 		}
-		wg.Wait()
-
-		// Small gap between bursts
-		time.Sleep(100 * time.Microsecond)
 	}
+
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(totalTasks)/elapsed.Seconds(), "tasks/s")
 }
 
 // ============================================================================
-// Memory Pressure Benchmarks
+// GC PRESSURE BENCHMARKS
 // ============================================================================
 
-func BenchmarkMemory_Pool_GCPressure(b *testing.B) {
+func BenchmarkMemory_GCPressure_Flock(b *testing.B) {
 	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
 		WithQueueSizePerWorker(512),
 	)
 	defer pool.Shutdown(true)
@@ -327,7 +570,7 @@ func BenchmarkMemory_Pool_GCPressure(b *testing.B) {
 	pool.Wait()
 }
 
-func BenchmarkMemory_Goroutines_GCPressure(b *testing.B) {
+func BenchmarkMemory_GCPressure_Goroutines(b *testing.B) {
 	var wg sync.WaitGroup
 
 	b.ReportAllocs()
@@ -347,38 +590,51 @@ func BenchmarkMemory_Goroutines_GCPressure(b *testing.B) {
 }
 
 // ============================================================================
-// Contention Benchmarks
+// HIGH CONTENTION BENCHMARKS
 // ============================================================================
 
-func BenchmarkContention_Pool_HighSubmitters(b *testing.B) {
-	pool, _ := NewPool(WithNumWorkers(runtime.NumCPU() * 10))
+func BenchmarkThroughput_HighContention_Flock(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*2),
+		WithQueueSizePerWorker(1024),
+	)
 	defer pool.Shutdown(true)
 
 	b.ResetTimer()
+	start := time.Now()
+
 	b.SetParallelism(100) // Many submitters
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			pool.Submit(func() {
-				time.Sleep(time.Microsecond)
+				time.Sleep(1 * time.Microsecond)
 			})
 		}
 	})
 	pool.Wait()
+
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
 }
 
-func BenchmarkContention_Goroutines_HighSubmitters(b *testing.B) {
+func BenchmarkThroughput_HighContention_Goroutines(b *testing.B) {
 	var wg sync.WaitGroup
 
 	b.ResetTimer()
+	start := time.Now()
+
 	b.SetParallelism(100) // Many submitters
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				time.Sleep(time.Microsecond)
+				time.Sleep(1 * time.Microsecond)
 			}()
 		}
 	})
 	wg.Wait()
+
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
 }
