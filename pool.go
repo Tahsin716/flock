@@ -362,6 +362,7 @@ func (p *Pool) submitBlocking(task func(), startIdx, numWorkers int) error {
 		for i := 0; i < numWorkers; i++ {
 			idx := (startIdx + i) % numWorkers
 			if p.workers[idx].queue.tryPush(task) {
+				atomic.AddInt64(&p.workers[idx].workload, 1)
 				p.workers[idx].signal()
 				return nil
 			}
@@ -388,6 +389,7 @@ func (p *Pool) submitNonBlocking(task func(), startIdx, numWorkers int) error {
 	for i := 0; i < numWorkers; i++ {
 		idx := (startIdx + i) % numWorkers
 		if p.workers[idx].queue.tryPush(task) {
+			atomic.AddInt64(&p.workers[idx].workload, 1)
 			p.workers[idx].signal()
 			return nil
 		}
@@ -410,6 +412,7 @@ func (p *Pool) submitWithFallback(task func(), startIdx, numWorkers int) error {
 	for i := 0; i < numWorkers; i++ {
 		idx := (startIdx + i) % numWorkers
 		if p.workers[idx].queue.tryPush(task) {
+			atomic.AddInt64(&p.workers[idx].workload, 1)
 			p.workers[idx].signal()
 			return nil
 		}
@@ -683,6 +686,7 @@ func (p *Pool) Stats() Stats {
 			TasksFailed:   atomic.LoadUint64(&wk.tasksFailed),
 			Capacity:      capacity,
 			State:         wk.getState().string(),
+			Workload:      atomic.LoadInt64(&wk.workload),
 		}
 	}
 

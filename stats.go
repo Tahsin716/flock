@@ -107,4 +107,7 @@ type WorkerStats struct {
 	//   - "PARKED": Sleeping, waiting for work or timeout
 	//   - "SHUTDOWN": Worker has stopped (pool is shutdown)
 	State string
+
+	// Workload is the current number of tasks in the worker's queue and executing.
+	Workload int64
 }

@@ -52,6 +52,8 @@ type worker struct {
 	// State management
 	state atomic.Value // workerState
 
+	workload int64 // atomic: estimated workload
+
 	// Metrics
 	tasksExecuted uint64 // atomic
 	tasksFailed   uint64 // atomic
@@ -309,6 +311,9 @@ func (w *worker) executeTask(task func()) {
 		duration := time.Since(startTime)
 		w.pool.recordLatency(duration)
 		atomic.AddUint64(&w.tasksExecuted, 1)
+
+		// Decrease workload estimate
+		atomic.AddInt64(&w.workload, -1)
 
 		// Use sharded metrics
 		shardIdx := fastrand() % numMetricShards
