@@ -164,10 +164,12 @@ func (w *worker) batchRefillFromGlobal() bool {
 
 			// Try to push to local queue
 			if w.queue.tryPush(task) {
+				atomic.AddInt64(&w.workload, 1) // Increment workload estimate
 				refilled = true
 			} else {
-				// Local queue full,
-				// execute immediately
+				// Local queue full, execute immediately
+				// Increment before execution, will be decremented in defer
+				atomic.AddInt64(&w.workload, 1)
 				w.executeTask(task)
 				return refilled
 			}
@@ -351,6 +353,10 @@ func (w *worker) drainQueues() {
 		if task == nil {
 			break
 		}
+
+		// Decrement workload for dropped tasks
+		atomic.AddInt64(&w.workload, -1)
+
 		shardIdx := fastrand() % numMetricShards
 		atomic.AddUint64(&w.pool.metricsShards[shardIdx].dropped, 1)
 		w.pool.submitWg.Done()

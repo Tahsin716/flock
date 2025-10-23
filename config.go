@@ -45,7 +45,13 @@ type Config struct {
 	// Default: 30 iterations (~1-10µs on modern CPUs)
 	SpinCount int
 
+	// BlockingStrategy controls behavior when all worker queues are full.
+	// Default: BlockWhenQueueFull
 	BlockingStrategy BlockingStrategy
+
+	// LoadBalancingStrategy controls how tasks are assigned to workers.
+	// Default: RoundRobin
+	LoadBalancingStrategy LoadBalancingStrategy
 }
 
 // BlockingStrategy determines how the pool behaves when all worker queues are full.
@@ -130,16 +136,30 @@ const (
 	NewThreadWhenQueueFull
 )
 
+// LoadBalancingStrategy determines how tasks are distributed among workers.
+type LoadBalancingStrategy int32
+
+const (
+	// RoundRobin distributes tasks sequentially across workers.
+	// Simple, fair, and cache-friendly for uniform workloads.
+	RoundRobin LoadBalancingStrategy = iota
+
+	// PowerOfTwoChoices samples two random workers and selects the one
+	// with lower current workload. Better for skewed/mixed workloads.
+	PowerOfTwoChoices
+)
+
 // defaultConfig returns a Config with production-ready defaults
 func defaultConfig() Config {
 	return Config{
-		NumWorkers:         runtime.NumCPU(), // runtime.NumCPU()
-		QueueSizePerWorker: 256,
-		PanicHandler:       nil,
-		MaxParkTime:        10 * time.Millisecond,
-		SpinCount:          30,
-		PinWorkerThreads:   false,
-		BlockingStrategy:   BlockWhenQueueFull,
+		NumWorkers:            runtime.NumCPU(), // runtime.NumCPU()
+		QueueSizePerWorker:    256,
+		PanicHandler:          nil,
+		MaxParkTime:           10 * time.Millisecond,
+		SpinCount:             30,
+		PinWorkerThreads:      false,
+		BlockingStrategy:      BlockWhenQueueFull,
+		LoadBalancingStrategy: RoundRobin,
 	}
 }
 
@@ -183,6 +203,10 @@ func (c *Config) validate() error {
 
 	if c.BlockingStrategy < 0 || c.BlockingStrategy > 2 {
 		return errInvalidConfig("BlockingStrategy provided is invalid")
+	}
+
+	if c.LoadBalancingStrategy < 0 || c.LoadBalancingStrategy > 1 {
+		return errInvalidConfig("LoadBalancingStrategy is invalid")
 	}
 
 	return nil
@@ -546,4 +570,20 @@ func WithSpinCount(n int) Option {
 //	)
 func WithBlockingStrategy(b BlockingStrategy) Option {
 	return func(c *Config) { c.BlockingStrategy = b }
+}
+
+// WithLoadBalancingStrategy sets the load balancing strategy.
+//
+// RoundRobin: Best for uniform workloads, minimal overhead.
+// PowerOfTwoChoices: Best for mixed/skewed workloads, reduces tail latency.
+//
+// Default: RoundRobin
+//
+// Example:
+//
+//	pool, _ := flock.NewPool(
+//	    flock.WithLoadBalancingStrategy(flock.PowerOfTwoChoices),
+//	)
+func WithLoadBalancingStrategy(strategy LoadBalancingStrategy) Option {
+	return func(c *Config) { c.LoadBalancingStrategy = strategy }
 }

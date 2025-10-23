@@ -49,6 +49,9 @@ type Pool struct {
 	// Worker selection
 	nextWorkerId uint64
 
+	// Cached number of workers
+	numWorkers int
+
 	// Sharded metrics to reduce contention
 	metricsShards [numMetricShards]metricsShard
 
@@ -243,6 +246,7 @@ func NewPool(opts ...Option) (*Pool, error) {
 		config:      cfg,
 		workers:     make([]*worker, cfg.NumWorkers),
 		globalQueue: make(chan func(), globalQueueSize),
+		numWorkers:  cfg.NumWorkers,
 	}
 	pool.state.Store(poolStateRunning)
 
@@ -333,36 +337,136 @@ func (p *Pool) Submit(task func()) error {
 	return nil
 }
 
-// trySubmit attempts to submit using hybrid approach
+// trySubmit attempts to submit using the configured load balancing strategy
 func (p *Pool) trySubmit(task func()) error {
-	numWorkers := len(p.workers)
+	switch p.config.LoadBalancingStrategy {
+	case RoundRobin:
+		next := atomic.AddUint64(&p.nextWorkerId, 1)
+		startIdx := int(next % uint64(p.numWorkers))
+		return p.submitWithStartIndex(task, startIdx)
 
-	// Round-robin starting point (still useful for load distribution)
-	next := atomic.AddUint64(&p.nextWorkerId, 1)
-	startIdx := int(next % uint64(numWorkers))
+	case PowerOfTwoChoices:
+		// Sample two random workers
+		r1 := int(fastrand() % uint32(p.numWorkers))
+		r2 := int(fastrand() % uint32(p.numWorkers))
 
+		// Ensure different workers
+		if r1 == r2 {
+			r2 = (r2 + 1) % p.numWorkers
+		}
+
+		// Load current workload estimates
+		load1 := atomic.LoadInt64(&p.workers[r1].workload)
+		load2 := atomic.LoadInt64(&p.workers[r2].workload)
+
+		// Choose worker with lower load
+		var chosen, other int
+		if load2 < load1 {
+			chosen = r2
+			other = r1
+		} else {
+			chosen = r1
+			other = r2
+		}
+
+		// Try the chosen worker first
+		if p.workers[chosen].queue.tryPush(task) {
+			atomic.AddInt64(&p.workers[chosen].workload, 1)
+			p.workers[chosen].signal()
+			return nil
+		}
+
+		// Try the other worker before falling back
+		if p.workers[other].queue.tryPush(task) {
+			atomic.AddInt64(&p.workers[other].workload, 1)
+			p.workers[other].signal()
+			return nil
+		}
+
+		// Both full, fall back to global queue
+		return p.submitToFallback(task)
+
+	default:
+		// Should never happen due to validation
+		return p.submitWithStartIndex(task, 0)
+	}
+}
+
+// submitWithStartIndex tries workers starting from startIdx (RoundRobin fallback)
+func (p *Pool) submitWithStartIndex(task func(), startIdx int) error {
 	switch p.config.BlockingStrategy {
 	case BlockWhenQueueFull:
-		return p.submitBlocking(task, startIdx, numWorkers)
+		return p.submitBlocking(task, startIdx, p.numWorkers)
+	case ErrorWhenQueueFull:
+		return p.submitNonBlocking(task, startIdx, p.numWorkers)
+	case NewThreadWhenQueueFull:
+		return p.submitWithFallback(task, startIdx, p.numWorkers)
+	default:
+		return p.submitBlocking(task, startIdx, p.numWorkers)
+	}
+}
+
+// submitToFallback handles global queue or spawning based on strategy
+func (p *Pool) submitToFallback(task func()) error {
+	switch p.config.BlockingStrategy {
+	case BlockWhenQueueFull:
+		for p.state.Load().(PoolState) == poolStateRunning {
+			select {
+			case p.globalQueue <- task:
+				shardIdx := fastrand() % numMetricShards
+				atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+				return nil
+			default:
+				runtime.Gosched()
+			}
+		}
+		return ErrPoolShutdown
 
 	case ErrorWhenQueueFull:
-		return p.submitNonBlocking(task, startIdx, numWorkers)
+		select {
+		case p.globalQueue <- task:
+			shardIdx := fastrand() % numMetricShards
+			atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+			return nil
+		default:
+			return ErrQueueFull
+		}
 
 	case NewThreadWhenQueueFull:
-		return p.submitWithFallback(task, startIdx, numWorkers)
+		select {
+		case p.globalQueue <- task:
+			shardIdx := fastrand() % numMetricShards
+			atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+			return nil
+		default:
+			shardIdx := fastrand() % numMetricShards
+			atomic.AddUint64(&p.metricsShards[shardIdx].fallback, 1)
+			p.fallbackWg.Add(1)
+			go func() {
+				defer p.fallbackWg.Done()
+				if p.state.Load().(PoolState) != poolStateRunning {
+					shardIdx := fastrand() % numMetricShards
+					atomic.AddUint64(&p.metricsShards[shardIdx].dropped, 1)
+					p.submitWg.Done()
+					return
+				}
+				startTime := time.Now()
+				p.execute(task)
+				p.recordLatency(time.Since(startTime))
+			}()
+			return nil
+		}
 	}
-
 	return nil
 }
 
-// submitBlocking tries local queues, then global, then blocks
 func (p *Pool) submitBlocking(task func(), startIdx, numWorkers int) error {
 	for p.state.Load().(PoolState) == poolStateRunning {
 		// Phase 1: Try all local worker queues (fast path)
 		for i := 0; i < numWorkers; i++ {
 			idx := (startIdx + i) % numWorkers
 			if p.workers[idx].queue.tryPush(task) {
-				atomic.AddInt64(&p.workers[idx].workload, 1)
+				atomic.AddInt64(&p.workers[idx].workload, 1) // Increment workload
 				p.workers[idx].signal()
 				return nil
 			}
