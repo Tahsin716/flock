@@ -12,39 +12,111 @@ import (
 )
 
 // ============================================================================
-// INSTANT TASK BENCHMARKS (Queue overhead measurement)
+// LATENCY DISTRIBUTION FUNCTIONS
 // ============================================================================
 
-func BenchmarkThroughput_Instant_SingleProducer_Flock(b *testing.B) {
-	pool, err := NewPool(
-		WithNumWorkers(runtime.NumCPU()),
-		WithQueueSizePerWorker(1024),
-	)
+type latencyDist func(*rand.Rand) time.Duration
 
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
+var (
+	// Light skew (80/15/5) - cache-heavy workload
+	lightSkewDistribution = func(r *rand.Rand) time.Duration {
+		roll := r.Float64()
+		if roll < 0.80 {
+			return 1 * time.Microsecond
+		}
+		if roll < 0.95 {
+			return 10 * time.Microsecond
+		}
+		return 50 * time.Microsecond
 	}
 
+	// Medium skew (60/25/10/5) - typical web API
+	mediumSkewDistribution = func(r *rand.Rand) time.Duration {
+		roll := r.Float64()
+		if roll < 0.60 {
+			return 1 * time.Microsecond
+		}
+		if roll < 0.85 {
+			return 10 * time.Microsecond
+		}
+		if roll < 0.95 {
+			return 100 * time.Microsecond
+		}
+		return 1 * time.Millisecond
+	}
+
+	// Heavy skew (50/30/15/4/1) - diverse workload
+	heavySkewDistribution = func(r *rand.Rand) time.Duration {
+		roll := r.Float64()
+		if roll < 0.50 {
+			return 1 * time.Microsecond
+		}
+		if roll < 0.80 {
+			return 10 * time.Microsecond
+		}
+		if roll < 0.95 {
+			return 100 * time.Microsecond
+		}
+		if roll < 0.99 {
+			return 1 * time.Millisecond
+		}
+		return 10 * time.Millisecond
+	}
+
+	// Bimodal (95/5) - cache hit/miss pattern
+	bimodalDistribution = func(r *rand.Rand) time.Duration {
+		if r.Float64() < 0.95 {
+			return 1 * time.Microsecond
+		}
+		return 100 * time.Microsecond
+	}
+)
+
+// ============================================================================
+// SECTION 1: INSTANT TASKS (Queue Overhead Measurement)
+// ============================================================================
+
+func BenchmarkInstant_SingleProducer_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
 	defer pool.Shutdown(true)
 
 	b.ResetTimer()
 	start := time.Now()
-
 	for i := 0; i < b.N; i++ {
 		pool.Submit(func() {})
 	}
 	pool.Wait()
-
 	elapsed := time.Since(start)
 	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
 }
 
-func BenchmarkThroughput_Instant_SingleProducer_Goroutines(b *testing.B) {
+func BenchmarkInstant_SingleProducer_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	start := time.Now()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {})
+	}
+	pool.Wait()
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkInstant_SingleProducer_Goroutines(b *testing.B) {
 	var wg sync.WaitGroup
 
 	b.ResetTimer()
 	start := time.Now()
-
 	for i := 0; i < b.N; i++ {
 		wg.Add(1)
 		go func() {
@@ -52,320 +124,186 @@ func BenchmarkThroughput_Instant_SingleProducer_Goroutines(b *testing.B) {
 		}()
 	}
 	wg.Wait()
-
 	elapsed := time.Since(start)
 	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
 }
 
-func BenchmarkThroughput_Instant_MultipleProducers_Flock(b *testing.B) {
-	pool, err := NewPool(
+func BenchmarkInstant_MultiProducer_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()),
 		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(RoundRobin),
 	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
 	defer pool.Shutdown(true)
 
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
-
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				pool.Submit(func() {})
-			}
-		}()
-	}
-	wg.Wait()
-	pool.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration { return 0 }, runtime.NumCPU())
 }
 
-func BenchmarkThroughput_Instant_MultipleProducers_Goroutines(b *testing.B) {
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
+func BenchmarkInstant_MultiProducer_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
 
-	b.ResetTimer()
-	start := time.Now()
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration { return 0 }, runtime.NumCPU())
+}
 
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-				}()
-			}
-		}()
-	}
-	wg.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+func BenchmarkInstant_MultiProducer_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, func(r *rand.Rand) time.Duration { return 0 }, runtime.NumCPU())
 }
 
 // ============================================================================
-// I/O-BOUND TASK BENCHMARKS
+// SECTION 2: UNIFORM I/O TASKS (Fixed Duration)
 // ============================================================================
 
-func BenchmarkThroughput_1us_Flock(b *testing.B) {
-	pool, err := NewPool(
+func BenchmarkUniform_1us_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()*4),
 		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(RoundRobin),
 	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
 	defer pool.Shutdown(true)
 
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
-
-	b.ResetTimer()
-	var wg sync.WaitGroup
-	start := time.Now()
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				pool.Submit(func() {
-					time.Sleep(1 * time.Microsecond)
-				})
-			}
-		}()
-	}
-	wg.Wait()
-	pool.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration {
+		return 1 * time.Microsecond
+	}, runtime.NumCPU())
 }
 
-func BenchmarkThroughput_1us_Goroutines(b *testing.B) {
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
+func BenchmarkUniform_1us_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*4),
+		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
 
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					time.Sleep(1 * time.Microsecond)
-				}()
-			}
-		}()
-	}
-	wg.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration {
+		return 1 * time.Microsecond
+	}, runtime.NumCPU())
 }
 
-func BenchmarkThroughput_10us_Flock(b *testing.B) {
-	// Workers = NumCPU × (10us / 1us) = 8 × 10 = 80 workers
-	pool, err := NewPool(
+func BenchmarkUniform_1us_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, func(r *rand.Rand) time.Duration {
+		return 1 * time.Microsecond
+	}, runtime.NumCPU())
+}
+
+func BenchmarkUniform_10us_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()*10),
 		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(RoundRobin),
 	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
 	defer pool.Shutdown(true)
 
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
-
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				pool.Submit(func() {
-					time.Sleep(10 * time.Microsecond)
-				})
-			}
-		}()
-	}
-	wg.Wait()
-	pool.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration {
+		return 10 * time.Microsecond
+	}, runtime.NumCPU())
 }
 
-func BenchmarkThroughput_10us_Goroutines(b *testing.B) {
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
+func BenchmarkUniform_10us_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*10),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
 
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					time.Sleep(10 * time.Microsecond)
-				}()
-			}
-		}()
-	}
-	wg.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration {
+		return 10 * time.Microsecond
+	}, runtime.NumCPU())
 }
 
-func BenchmarkThroughput_100us_Flock(b *testing.B) {
-	pool, err := NewPool(
+func BenchmarkUniform_10us_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, func(r *rand.Rand) time.Duration {
+		return 10 * time.Microsecond
+	}, runtime.NumCPU())
+}
+
+func BenchmarkUniform_100us_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()*100),
 		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(RoundRobin),
 	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
 	defer pool.Shutdown(true)
 
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
-
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				pool.Submit(func() {
-					time.Sleep(100 * time.Microsecond)
-				})
-			}
-		}()
-	}
-	wg.Wait()
-	pool.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration {
+		return 100 * time.Microsecond
+	}, runtime.NumCPU())
 }
 
-func BenchmarkThroughput_100us_Goroutines(b *testing.B) {
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
+func BenchmarkUniform_100us_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*100),
+		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
 
-	b.ResetTimer()
-	start := time.Now()
+	runBenchmark(b, pool, func(r *rand.Rand) time.Duration {
+		return 100 * time.Microsecond
+	}, runtime.NumCPU())
+}
 
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					time.Sleep(100 * time.Microsecond)
-				}()
-			}
-		}()
-	}
-	wg.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+func BenchmarkUniform_100us_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, func(r *rand.Rand) time.Duration {
+		return 100 * time.Microsecond
+	}, runtime.NumCPU())
 }
 
 // ============================================================================
-// CPU-BOUND TASK BENCHMARKS
+// SECTION 3: CPU-BOUND TASKS
 // ============================================================================
 
-func BenchmarkThroughput_CPUBound_Flock(b *testing.B) {
-	pool, err := NewPool(
+func BenchmarkCPUBound_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()),
 		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(RoundRobin),
 	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
 	defer pool.Shutdown(true)
-
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
 
 	b.ResetTimer()
 	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < tasksPerProducer; j++ {
-				pool.Submit(func() {
-					sum := 0
-					for k := 0; k < 1000; k++ {
-						sum += k
-					}
-					_ = sum
-				})
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			sum := 0
+			for k := 0; k < 1000; k++ {
+				sum += k
 			}
-		}()
+			_ = sum
+		})
 	}
-	wg.Wait()
-	pool.Wait()
-
 	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
+	pool.Wait()
+}
+
+func BenchmarkCPUBound_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	start := time.Now()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			sum := 0
+			for k := 0; k < 1000; k++ {
+				sum += k
+			}
+			_ = sum
+		})
+	}
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
+	pool.Wait()
 }
 
 func BenchmarkThroughput_CPUBound_Goroutines(b *testing.B) {
@@ -401,16 +339,285 @@ func BenchmarkThroughput_CPUBound_Goroutines(b *testing.B) {
 }
 
 // ============================================================================
-// MEMORY ALLOCATION BENCHMARKS
+// SECTION 4: VARIABLE LOAD (Light Skew)
 // ============================================================================
 
-func BenchmarkMemory_Alloc_Flock(b *testing.B) {
-	pool, err := NewPool()
+func BenchmarkLightSkew_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*10),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
 	defer pool.Shutdown(true)
 
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
+	runBenchmark(b, pool, lightSkewDistribution, runtime.NumCPU())
+}
+
+func BenchmarkLightSkew_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*10),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, lightSkewDistribution, runtime.NumCPU())
+}
+
+func BenchmarkLightSkew_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, lightSkewDistribution, runtime.NumCPU())
+}
+
+// ============================================================================
+// SECTION 5: VARIABLE LOAD (Medium Skew)
+// ============================================================================
+
+func BenchmarkMediumSkew_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*30),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, mediumSkewDistribution, runtime.NumCPU())
+}
+
+func BenchmarkMediumSkew_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*30),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, mediumSkewDistribution, runtime.NumCPU())
+}
+
+func BenchmarkMediumSkew_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, mediumSkewDistribution, runtime.NumCPU())
+}
+
+// ============================================================================
+// SECTION 6: VARIABLE LOAD (Heavy Skew)
+// ============================================================================
+
+func BenchmarkHeavySkew_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*50),
+		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, heavySkewDistribution, runtime.NumCPU())
+}
+
+func BenchmarkHeavySkew_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*50),
+		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, heavySkewDistribution, runtime.NumCPU())
+}
+
+func BenchmarkHeavySkew_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, heavySkewDistribution, runtime.NumCPU())
+}
+
+// ============================================================================
+// SECTION 7: BIMODAL DISTRIBUTION (Cache Hit/Miss)
+// ============================================================================
+
+func BenchmarkBimodal_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*10),
+		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, bimodalDistribution, runtime.NumCPU())
+}
+
+func BenchmarkBimodal_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*10),
+		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, bimodalDistribution, runtime.NumCPU())
+}
+
+func BenchmarkBimodal_Goroutines(b *testing.B) {
+	runBenchmarkGoroutines(b, bimodalDistribution, runtime.NumCPU())
+}
+
+// ============================================================================
+// SECTION 8: HIGH CONTENTION (100 Submitters)
+// ============================================================================
+
+func BenchmarkHighContention_MediumSkew_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*30),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, mediumSkewDistribution, 100)
+}
+
+func BenchmarkHighContention_MediumSkew_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*30),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runBenchmark(b, pool, mediumSkewDistribution, 100)
+}
+
+// ============================================================================
+// SECTION 9: PATHOLOGICAL CASE (Worst for Round-Robin)
+// ============================================================================
+
+func BenchmarkPathological_RoundRobin(b *testing.B) {
+	numWorkers := 8
+	pool, _ := NewPool(
+		WithNumWorkers(numWorkers),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	start := time.Now()
+
+	for i := 0; i < b.N; i++ {
+		var duration time.Duration
+		if i%numWorkers == 0 { // Every 8th task
+			duration = 100 * time.Microsecond
+		} else {
+			duration = 1 * time.Microsecond
+		}
+		pool.Submit(func() {
+			time.Sleep(duration)
+		})
 	}
+
+	pool.Wait()
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
+}
+
+func BenchmarkPathological_P2C(b *testing.B) {
+	numWorkers := 8
+	pool, _ := NewPool(
+		WithNumWorkers(numWorkers),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	b.ResetTimer()
+	start := time.Now()
+
+	for i := 0; i < b.N; i++ {
+		var duration time.Duration
+		if i%numWorkers == 0 { // Every 8th task
+			duration = 100 * time.Microsecond
+		} else {
+			duration = 1 * time.Microsecond
+		}
+		pool.Submit(func() {
+			time.Sleep(duration)
+		})
+	}
+
+	pool.Wait()
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
+}
+
+// ============================================================================
+// SECTION 10: LATENCY BENCHMARKS (p50/p95/p99)
+// ============================================================================
+
+func BenchmarkLatency_MediumSkew_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*30),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	runLatencyBenchmark(b, pool, mediumSkewDistribution)
+}
+
+func BenchmarkLatency_MediumSkew_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*30),
+		WithQueueSizePerWorker(1024),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runLatencyBenchmark(b, pool, mediumSkewDistribution)
+}
+
+func BenchmarkLatency_HeavySkew_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*100),
+		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	runLatencyBenchmark(b, pool, heavySkewDistribution)
+}
+
+func BenchmarkLatency_HeavySkew_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*100),
+		WithQueueSizePerWorker(2048),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runLatencyBenchmark(b, pool, heavySkewDistribution)
+}
+
+// ============================================================================
+// SECTION 11: MEMORY/GC PRESSURE
+// ============================================================================
+
+func BenchmarkMemory_Alloc_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithLoadBalancingStrategy(RoundRobin),
+	)
+	defer pool.Shutdown(true)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {})
+	}
+	pool.Wait()
+}
+
+func BenchmarkMemory_Alloc_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -436,178 +643,12 @@ func BenchmarkMemory_Alloc_Goroutines(b *testing.B) {
 	wg.Wait()
 }
 
-// ============================================================================
-// MIXED WORKLOAD BENCHMARKS
-// ============================================================================
-
-func BenchmarkThroughput_MixedLoad_Flock(b *testing.B) {
-	pool, err := NewPool(
-		WithNumWorkers(runtime.NumCPU()*8),
-		WithQueueSizePerWorker(1024),
-	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
-	defer pool.Shutdown(true)
-
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
-
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func(seed int64) {
-			defer wg.Done()
-			r := rand.New(rand.NewSource(seed))
-
-			for j := 0; j < tasksPerProducer; j++ {
-				// Random distribution: 70% fast, 20% medium, 10% slow
-				roll := r.Float64()
-				var duration time.Duration
-				if roll < 0.70 {
-					duration = 1 * time.Microsecond
-				} else if roll < 0.90 {
-					duration = 10 * time.Microsecond
-				} else {
-					duration = 100 * time.Microsecond
-				}
-
-				pool.Submit(func() {
-					time.Sleep(duration)
-				})
-			}
-		}(time.Now().UnixNano() + int64(i))
-	}
-	wg.Wait()
-	pool.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
-}
-
-func BenchmarkThroughput_MixedLoad_Goroutines(b *testing.B) {
-	numProducers := runtime.NumCPU()
-	tasksPerProducer := b.N / numProducers
-
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < numProducers; i++ {
-		wg.Add(1)
-		go func(seed int64) {
-			defer wg.Done()
-			r := rand.New(rand.NewSource(seed))
-
-			for j := 0; j < tasksPerProducer; j++ {
-				roll := r.Float64()
-				var duration time.Duration
-				if roll < 0.70 {
-					duration = 1 * time.Microsecond
-				} else if roll < 0.90 {
-					duration = 10 * time.Microsecond
-				} else {
-					duration = 100 * time.Microsecond
-				}
-
-				wg.Add(1)
-				go func(d time.Duration) {
-					defer wg.Done()
-					time.Sleep(d)
-				}(duration)
-			}
-		}(time.Now().UnixNano() + int64(i))
-	}
-	wg.Wait()
-
-	elapsed := time.Since(start)
-	actualTasks := numProducers * tasksPerProducer
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
-}
-
-// ============================================================================
-// BURST LOAD BENCHMARKS
-// ============================================================================
-
-func BenchmarkThroughput_BurstLoad_Flock(b *testing.B) {
-	pool, err := NewPool(
-		WithNumWorkers(runtime.NumCPU()*10),
-		WithQueueSizePerWorker(1024),
-	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
-	defer pool.Shutdown(true)
-
-	const tasksPerBurst = 100
-	burstsNeeded := (b.N + tasksPerBurst - 1) / tasksPerBurst
-
-	b.ResetTimer()
-	start := time.Now()
-
-	// Submit all bursts, then wait once
-	for i := 0; i < burstsNeeded; i++ {
-		for j := 0; j < tasksPerBurst; j++ {
-			pool.Submit(func() {
-				time.Sleep(10 * time.Microsecond)
-			})
-		}
-		time.Sleep(500 * time.Microsecond) // Short pause between bursts
-	}
-	pool.Wait()
-	elapsed := time.Since(start)
-	actualTasks := tasksPerBurst * burstsNeeded
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
-}
-
-func BenchmarkThroughput_BurstLoad_Goroutines(b *testing.B) {
-	var wg sync.WaitGroup
-
-	b.ResetTimer()
-	start := time.Now()
-
-	const tasksPerBurst = 100
-	burstsNeeded := (b.N + tasksPerBurst - 1) / tasksPerBurst
-
-	for i := 0; i < burstsNeeded; i++ {
-		for j := 0; j < tasksPerBurst; j++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				time.Sleep(10 * time.Microsecond)
-			}()
-		}
-		time.Sleep(500 * time.Microsecond) // Short pause between bursts
-	}
-
-	wg.Wait()
-	elapsed := time.Since(start)
-	actualTasks := tasksPerBurst * burstsNeeded
-	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
-}
-
-// ============================================================================
-// GC PRESSURE BENCHMARKS
-// ============================================================================
-
-func BenchmarkMemory_GCPressure_Flock(b *testing.B) {
-	pool, err := NewPool(
+func BenchmarkMemory_GCPressure_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
 		WithNumWorkers(runtime.NumCPU()),
 		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(RoundRobin),
 	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
 	defer pool.Shutdown(true)
 
 	b.ReportAllocs()
@@ -615,7 +656,27 @@ func BenchmarkMemory_GCPressure_Flock(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		pool.Submit(func() {
-			// Create garbage
+			for j := 0; j < 100; j++ {
+				_ = make([]byte, 64)
+			}
+		})
+	}
+	pool.Wait()
+}
+
+func BenchmarkMemory_GCPressure_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()),
+		WithQueueSizePerWorker(512),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
 			for j := 0; j < 100; j++ {
 				_ = make([]byte, 64)
 			}
@@ -634,7 +695,6 @@ func BenchmarkMemory_GCPressure_Goroutines(b *testing.B) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Create garbage
 			for j := 0; j < 100; j++ {
 				_ = make([]byte, 64)
 			}
@@ -644,74 +704,19 @@ func BenchmarkMemory_GCPressure_Goroutines(b *testing.B) {
 }
 
 // ============================================================================
-// HIGH CONTENTION BENCHMARKS
+// SECTION 12: REALISTIC WEB API SIMULATION (30 seconds)
 // ============================================================================
 
-func BenchmarkThroughput_HighContention_Flock(b *testing.B) {
-	pool, err := NewPool(
-		WithNumWorkers(runtime.NumCPU()*4),
-		WithQueueSizePerWorker(1024),
-	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
-	defer pool.Shutdown(true)
-
-	b.ResetTimer()
-	start := time.Now()
-
-	b.SetParallelism(100) // Many submitters
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			pool.Submit(func() {
-				time.Sleep(1 * time.Microsecond)
-			})
-		}
-	})
-	pool.Wait()
-
-	elapsed := time.Since(start)
-	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
-}
-
-func BenchmarkThroughput_HighContention_Goroutines(b *testing.B) {
-	var wg sync.WaitGroup
-
-	b.ResetTimer()
-	start := time.Now()
-
-	b.SetParallelism(100) // Many submitters
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				time.Sleep(1 * time.Microsecond)
-			}()
-		}
-	})
-	wg.Wait()
-	elapsed := time.Since(start)
-	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "tasks/s")
-}
-
-// ============================================================================
-// REALISTIC API SIMULATION BENCHMARKS
-// ============================================================================
-
-// API endpoint latency profiles
 var apiProfiles = []struct {
 	name     string
 	duration time.Duration
 	weight   float64
 }{
-	{"cache_hit", 1 * time.Millisecond, 0.50},      // Fast: Redis/cache
-	{"db_query", 5 * time.Millisecond, 0.30},       // Medium: Simple DB query
-	{"complex_query", 15 * time.Millisecond, 0.12}, // Slow: Complex join
-	{"external_api", 50 * time.Millisecond, 0.06},  // Very slow: Third-party API
-	{"timeout", 200 * time.Millisecond, 0.02},      // Timeout/retry scenario
+	{"cache_hit", 1 * time.Millisecond, 0.50},
+	{"db_query", 5 * time.Millisecond, 0.30},
+	{"complex_query", 15 * time.Millisecond, 0.12},
+	{"external_api", 50 * time.Millisecond, 0.06},
+	{"timeout", 200 * time.Millisecond, 0.02},
 }
 
 func selectAPILatency(r *rand.Rand) time.Duration {
@@ -777,28 +782,172 @@ func (m *apiMetrics) report(b *testing.B, duration time.Duration) {
 	b.ReportMetric(float64(avgQueue.Microseconds()), "avg_queue_us")
 }
 
-func BenchmarkRealisticAPI_30s_Flock(b *testing.B) {
-	pool, err := NewPool(
-		WithNumWorkers(runtime.NumCPU()*100),
-		WithQueueSizePerWorker(2048),
+func BenchmarkRealisticAPI_30s_RoundRobin(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*4),
+		WithQueueSizePerWorker(4096),
 		WithBlockingStrategy(BlockWhenQueueFull),
+		WithLoadBalancingStrategy(RoundRobin),
 	)
-
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-
 	defer pool.Shutdown(true)
 
-	duration := 30 * time.Second
-	numClients := runtime.NumCPU() * 2
+	runRealisticAPIBenchmark(b, pool, 30*time.Second)
+}
 
+func BenchmarkRealisticAPI_30s_P2C(b *testing.B) {
+	pool, _ := NewPool(
+		WithNumWorkers(runtime.NumCPU()*4),
+		WithQueueSizePerWorker(4096),
+		WithBlockingStrategy(BlockWhenQueueFull),
+		WithLoadBalancingStrategy(PowerOfTwoChoices),
+	)
+	defer pool.Shutdown(true)
+
+	runRealisticAPIBenchmark(b, pool, 30*time.Second)
+}
+
+func BenchmarkRealisticAPI_30s_Goroutines(b *testing.B) {
+	runRealisticAPIBenchmarkGoroutines(b, 30*time.Second)
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+func runBenchmark(b *testing.B, pool *Pool, dist latencyDist, numProducers int) {
+	tasksPerProducer := b.N / numProducers
+	actualTasks := numProducers * tasksPerProducer
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(seed))
+			for j := 0; j < tasksPerProducer; j++ {
+				duration := dist(r)
+				pool.Submit(func() {
+					if duration > 0 {
+						time.Sleep(duration)
+					}
+				})
+			}
+		}(time.Now().UnixNano() + int64(i))
+	}
+	wg.Wait()
+	pool.Wait()
+
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+func runBenchmarkGoroutines(b *testing.B, dist latencyDist, numProducers int) {
+	tasksPerProducer := b.N / numProducers
+	actualTasks := numProducers * tasksPerProducer
+
+	b.ResetTimer()
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(seed))
+			for j := 0; j < tasksPerProducer; j++ {
+				duration := dist(r)
+				wg.Add(1)
+				go func(d time.Duration) {
+					defer wg.Done()
+					if d > 0 {
+						time.Sleep(d)
+					}
+				}(duration)
+			}
+		}(time.Now().UnixNano() + int64(i))
+	}
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(actualTasks)/elapsed.Seconds(), "tasks/s")
+}
+
+func runLatencyBenchmark(b *testing.B, pool *Pool, dist latencyDist) {
+	numProducers := runtime.NumCPU()
+	tasksPerProducer := b.N / numProducers
+
+	type producerMetrics struct {
+		latencies []time.Duration
+	}
+	metrics := make([]producerMetrics, numProducers)
+	for i := range metrics {
+		metrics[i].latencies = make([]time.Duration, 0, tasksPerProducer)
+	}
+
+	b.ResetTimer()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numProducers; i++ {
+		wg.Add(1)
+		go func(producerID int, seed int64) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(seed))
+
+			for j := 0; j < tasksPerProducer; j++ {
+				duration := dist(r)
+
+				start := time.Now()
+				done := make(chan struct{})
+
+				pool.Submit(func() {
+					time.Sleep(duration)
+					close(done)
+				})
+
+				<-done
+				elapsed := time.Since(start)
+
+				metrics[producerID].latencies = append(metrics[producerID].latencies, elapsed)
+			}
+		}(i, time.Now().UnixNano()+int64(i))
+	}
+	wg.Wait()
+	pool.Wait()
+
+	var allLatencies []time.Duration
+	for i := range metrics {
+		allLatencies = append(allLatencies, metrics[i].latencies...)
+	}
+
+	sort.Slice(allLatencies, func(i, j int) bool {
+		return allLatencies[i] < allLatencies[j]
+	})
+
+	if len(allLatencies) > 0 {
+		n := len(allLatencies)
+		p50 := allLatencies[n*50/100]
+		p95 := allLatencies[n*95/100]
+		p99 := allLatencies[n*99/100]
+		pMax := allLatencies[n-1]
+
+		b.ReportMetric(float64(p50.Microseconds()), "p50_us")
+		b.ReportMetric(float64(p95.Microseconds()), "p95_us")
+		b.ReportMetric(float64(p99.Microseconds()), "p99_us")
+		b.ReportMetric(float64(pMax.Microseconds()), "max_us")
+	}
+}
+
+func runRealisticAPIBenchmark(b *testing.B, pool *Pool, duration time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
 	metrics := &apiMetrics{
 		latencies: make([]int64, 0, 1000000),
 	}
+	numClients := runtime.NumCPU()
 
 	var wg sync.WaitGroup
 	wg.Add(numClients)
@@ -859,17 +1008,15 @@ func BenchmarkRealisticAPI_30s_Flock(b *testing.B) {
 	b.Logf("Fallback executions: %d", stats.FallbackExecuted)
 }
 
-func BenchmarkRealisticAPI_30s_Goroutines(b *testing.B) {
-
-	duration := 30 * time.Second
-	numClients := runtime.NumCPU() * 2
-
+func runRealisticAPIBenchmarkGoroutines(b *testing.B, duration time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
 	metrics := &apiMetrics{
 		latencies: make([]int64, 0, 1000000),
 	}
+
+	numClients := runtime.NumCPU()
 
 	var clientWg sync.WaitGroup
 	clientWg.Add(numClients)
@@ -892,9 +1039,7 @@ func BenchmarkRealisticAPI_30s_Goroutines(b *testing.B) {
 				apiDuration := selectAPILatency(r)
 
 				submitTime := time.Now()
-
-				// Acquire semaphore
-				queueWait := time.Since(submitTime)
+				queueWait := time.Duration(0)
 
 				var taskWg sync.WaitGroup
 				taskWg.Add(1)
